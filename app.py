@@ -7,6 +7,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ---------------------------------------------------------------------------
 # Surf spot catalogue
@@ -29,6 +30,47 @@ SURF_SPOTS = {
         {"name": "Lennox Head", "lat": -28.797, "lon": 153.588, "orientation": 60, "break_type": "Point"},
         {"name": "Ballina", "lat": -28.871, "lon": 153.563, "orientation": 90, "break_type": "Beach"},
     ],
+}
+
+# ---------------------------------------------------------------------------
+# Webcam catalogue
+# Embed sources: YouTube iframe where a public live cam exists, Swellnet page
+# link for all spots (free low-res preview, no account required to view).
+# Update the "youtube" ID when a better 24/7 stream is found.
+# ---------------------------------------------------------------------------
+
+WEBCAMS = {
+    "Snapper Rocks": {
+        "youtube": "VbnLxUlT4io",
+        "swellnet": "https://www.swellnet.com/surfcams/snapper-rocks",
+    },
+    "Kirra Beach": {
+        "swellnet": "https://www.swellnet.com/surfcams/kirra",
+    },
+    "Burleigh Heads": {
+        "swellnet": "https://www.swellnet.com/surfcams/burleigh-heads",
+    },
+    "Coolangatta Beach": {
+        "swellnet": "https://www.swellnet.com/surfcams/coolangatta",
+    },
+    "Noosa Heads": {
+        "swellnet": "https://www.swellnet.com/surfcams/noosa-heads",
+    },
+    "Mooloolaba Beach": {
+        "swellnet": "https://www.swellnet.com/surfcams/mooloolaba",
+    },
+    "Maroochydore": {
+        "swellnet": "https://www.swellnet.com/surfcams/maroochydore",
+    },
+    "Byron Bay \u2013 The Pass": {
+        "swellnet": "https://www.swellnet.com/surfcams/byron-bay",
+    },
+    "Lennox Head": {
+        "swellnet": "https://www.swellnet.com/surfcams/lennox-head",
+    },
+    "Ballina": {
+        "swellnet": "https://www.swellnet.com/surfcams/ballina",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -195,6 +237,41 @@ def best_window(df: pd.DataFrame, spot: dict) -> pd.DataFrame:
 
 st.set_page_config(page_title="Surf Buddy 🏄", page_icon="🏄", layout="wide")
 
+# Light, clean theme
+st.markdown("""
+<style>
+    /* Main background */
+    .stApp { background-color: #f7f9fc; }
+
+    /* Sidebar */
+    [data-testid="stSidebar"] {
+        background-color: #ffffff;
+        border-right: 1px solid #e4e8ef;
+    }
+
+    /* Metric cards */
+    [data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #e4e8ef;
+        border-radius: 10px;
+        padding: 14px 18px;
+    }
+
+    /* Headings */
+    h1 { font-size: 2rem !important; font-weight: 700 !important; color: #1a1a2e !important; }
+    h2, h3 { color: #1a1a2e !important; font-weight: 600 !important; }
+
+    /* Tabs */
+    [data-testid="stTabs"] button { font-weight: 500; }
+
+    /* Caption / small text */
+    .stCaption { color: #6c757d !important; }
+
+    /* Divider */
+    hr { border-color: #e4e8ef !important; }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("🏄 Surf Buddy")
 st.caption('"Know before you go. Surf smarter. It\'s on."')
 
@@ -264,6 +341,34 @@ st.markdown(bar_html, unsafe_allow_html=True)
 st.divider()
 
 # ---------------------------------------------------------------------------
+# Live Webcam
+# ---------------------------------------------------------------------------
+
+st.subheader("📷 Live Webcam")
+
+cam = WEBCAMS.get(spot_name, {})
+youtube_id = cam.get("youtube")
+swellnet_url = cam.get("swellnet")
+
+if youtube_id:
+    components.iframe(
+        f"https://www.youtube.com/embed/{youtube_id}?autoplay=1&mute=1&rel=0",
+        height=420,
+        scrolling=False,
+    )
+else:
+    st.info(
+        "No embedded live cam available for this spot yet. "
+        "Tap the button below to watch on Swellnet. 🎥",
+        icon="📹",
+    )
+
+if swellnet_url:
+    st.link_button(f"🎥 Watch {spot_name} live cam on Swellnet →", swellnet_url)
+
+st.divider()
+
+# ---------------------------------------------------------------------------
 # "Go Surf" recommendation
 # ---------------------------------------------------------------------------
 
@@ -288,7 +393,7 @@ if not top.empty:
         display.columns = ["Time", "Wave (m)", "Period (s)", "Wind (km/h)", "Score"]
         display["Time"] = display["Time"].dt.strftime("%a %d %b %H:%M")
         display["Score"] = display["Score"].apply(lambda x: f"{x} {score_label(x)}")
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.dataframe(display, width='stretch', hide_index=True)
 
 st.divider()
 
@@ -310,7 +415,7 @@ with tab1:
     fig.update_layout(yaxis_range=[0, 10], hovermode="x unified")
     fig.add_hline(y=6, line_dash="dash", line_color="green", annotation_text="Good")
     fig.add_hline(y=8, line_dash="dash", line_color="gold", annotation_text="Epic")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 with tab2:
     fig2 = go.Figure()
@@ -328,7 +433,7 @@ with tab2:
         hovermode="x unified",
         yaxis_title="Wave Height (m) | Period / 10 (s)",
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width='stretch')
 
 with tab3:
     fig3 = go.Figure()
@@ -347,7 +452,7 @@ with tab3:
         legend=dict(orientation="h"),
         hovermode="x unified",
     )
-    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(fig3, width='stretch')
 
 with tab4:
     fig4 = px.scatter_polar(
@@ -359,7 +464,7 @@ with tab4:
         labels={"wave_direction": "Swell Direction (°)", "wave_height": "Height (m)", "score": "Score"},
     )
     fig4.update_layout(polar=dict(angularaxis=dict(direction="clockwise", rotation=90)))
-    st.plotly_chart(fig4, use_container_width=True)
+    st.plotly_chart(fig4, width='stretch')
 
 st.divider()
 
@@ -398,8 +503,8 @@ if rankings:
         return f"color: {score_color(val)}; font-weight: bold"
 
     st.dataframe(
-        rank_df.style.applymap(_color_score, subset=["Score"]),
-        use_container_width=True,
+        rank_df.style.map(_color_score, subset=["Score"]),
+        width='stretch',
     )
 
 st.caption("🌊 Surf Buddy — 100% free for all surfers. Data via Open-Meteo.")
