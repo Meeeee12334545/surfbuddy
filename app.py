@@ -7,6 +7,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ---------------------------------------------------------------------------
 # Surf spot catalogue
@@ -29,6 +30,47 @@ SURF_SPOTS = {
         {"name": "Lennox Head", "lat": -28.797, "lon": 153.588, "orientation": 60, "break_type": "Point"},
         {"name": "Ballina", "lat": -28.871, "lon": 153.563, "orientation": 90, "break_type": "Beach"},
     ],
+}
+
+# ---------------------------------------------------------------------------
+# Webcam catalogue
+# Embed sources: YouTube iframe where a public live cam exists, Swellnet page
+# link for all spots (free low-res preview, no account required to view).
+# Update the "youtube" ID when a better 24/7 stream is found.
+# ---------------------------------------------------------------------------
+
+WEBCAMS = {
+    "Snapper Rocks": {
+        "youtube": "VbnLxUlT4io",
+        "swellnet": "https://www.swellnet.com/surfcams/snapper-rocks",
+    },
+    "Kirra Beach": {
+        "swellnet": "https://www.swellnet.com/surfcams/kirra",
+    },
+    "Burleigh Heads": {
+        "swellnet": "https://www.swellnet.com/surfcams/burleigh-heads",
+    },
+    "Coolangatta Beach": {
+        "swellnet": "https://www.swellnet.com/surfcams/coolangatta",
+    },
+    "Noosa Heads": {
+        "swellnet": "https://www.swellnet.com/surfcams/noosa-heads",
+    },
+    "Mooloolaba Beach": {
+        "swellnet": "https://www.swellnet.com/surfcams/mooloolaba",
+    },
+    "Maroochydore": {
+        "swellnet": "https://www.swellnet.com/surfcams/maroochydore",
+    },
+    "Byron Bay \u2013 The Pass": {
+        "swellnet": "https://www.swellnet.com/surfcams/byron-bay",
+    },
+    "Lennox Head": {
+        "swellnet": "https://www.swellnet.com/surfcams/lennox-head",
+    },
+    "Ballina": {
+        "swellnet": "https://www.swellnet.com/surfcams/ballina",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -195,6 +237,41 @@ def best_window(df: pd.DataFrame, spot: dict) -> pd.DataFrame:
 
 st.set_page_config(page_title="Surf Buddy 🏄", page_icon="🏄", layout="wide")
 
+# Light, clean theme
+st.markdown("""
+<style>
+    /* Main background */
+    .stApp { background-color: #f7f9fc; }
+
+    /* Sidebar */
+    [data-testid="stSidebar"] {
+        background-color: #ffffff;
+        border-right: 1px solid #e4e8ef;
+    }
+
+    /* Metric cards */
+    [data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #e4e8ef;
+        border-radius: 10px;
+        padding: 14px 18px;
+    }
+
+    /* Headings */
+    h1 { font-size: 2rem !important; font-weight: 700 !important; color: #1a1a2e !important; }
+    h2, h3 { color: #1a1a2e !important; font-weight: 600 !important; }
+
+    /* Tabs */
+    [data-testid="stTabs"] button { font-weight: 500; }
+
+    /* Caption / small text */
+    .stCaption { color: #6c757d !important; }
+
+    /* Divider */
+    hr { border-color: #e4e8ef !important; }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("🏄 Surf Buddy")
 st.caption('"Know before you go. Surf smarter. It\'s on."')
 
@@ -260,6 +337,34 @@ bar_html = f"""
 </div>
 """
 st.markdown(bar_html, unsafe_allow_html=True)
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Live Webcam
+# ---------------------------------------------------------------------------
+
+st.subheader("📷 Live Webcam")
+
+cam = WEBCAMS.get(spot_name, {})
+youtube_id = cam.get("youtube")
+swellnet_url = cam.get("swellnet")
+
+if youtube_id:
+    components.iframe(
+        f"https://www.youtube.com/embed/{youtube_id}?autoplay=1&mute=1&rel=0",
+        height=420,
+        scrolling=False,
+    )
+else:
+    st.info(
+        "No embedded live cam available for this spot yet. "
+        "Tap the button below to watch on Swellnet. 🎥",
+        icon="📹",
+    )
+
+if swellnet_url:
+    st.link_button(f"🎥 Watch {spot_name} live cam on Swellnet →", swellnet_url)
 
 st.divider()
 
