@@ -10,7 +10,42 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # ---------------------------------------------------------------------------
-# Surf spot catalogue
+# SEQ Live Surf Cam Catalogue
+# Comprehensive South East Queensland surf cam database.
+#   youtube  : YouTube 24/7 live stream video ID (directly embeddable)
+#   swellnet : Swellnet cam slug → swellnet.com/surfcams/{slug}
+# ---------------------------------------------------------------------------
+
+SEQ_CAMS = [
+    # ── Gold Coast ──────────────────────────────────────────────────────────
+    {"name": "Snapper Rocks",     "region": "Gold Coast",     "youtube": "VbnLxUlT4io", "swellnet": "snapper-rocks"},
+    {"name": "Kirra Beach",       "region": "Gold Coast",     "swellnet": "kirra"},
+    {"name": "Duranbah",          "region": "Gold Coast",     "swellnet": "duranbah"},
+    {"name": "Coolangatta Beach", "region": "Gold Coast",     "swellnet": "coolangatta"},
+    {"name": "Currumbin Alley",   "region": "Gold Coast",     "swellnet": "currumbin-alley"},
+    {"name": "Palm Beach",        "region": "Gold Coast",     "swellnet": "palm-beach"},
+    {"name": "Tugun",             "region": "Gold Coast",     "swellnet": "tugun"},
+    {"name": "Narrowneck",        "region": "Gold Coast",     "swellnet": "narrowneck"},
+    {"name": "Surfers Paradise",  "region": "Gold Coast",     "swellnet": "surfers-paradise"},
+    {"name": "Broadbeach",        "region": "Gold Coast",     "swellnet": "broadbeach"},
+    {"name": "Mermaid Beach",     "region": "Gold Coast",     "swellnet": "mermaid-beach"},
+    {"name": "Miami Beach",       "region": "Gold Coast",     "swellnet": "miami"},
+    {"name": "Burleigh Heads",    "region": "Gold Coast",     "swellnet": "burleigh-heads"},
+    {"name": "South Stradbroke",  "region": "Gold Coast",     "swellnet": "south-stradbroke"},
+    # ── Sunshine Coast ──────────────────────────────────────────────────────
+    {"name": "Noosa Heads",        "region": "Sunshine Coast", "swellnet": "noosa-heads"},
+    {"name": "Sunshine Beach",     "region": "Sunshine Coast", "swellnet": "sunshine-beach"},
+    {"name": "Peregian Beach",     "region": "Sunshine Coast", "swellnet": "peregian"},
+    {"name": "Coolum Beach",       "region": "Sunshine Coast", "swellnet": "coolum"},
+    {"name": "Alexandra Headland", "region": "Sunshine Coast", "swellnet": "alex-headland"},
+    {"name": "Mooloolaba",         "region": "Sunshine Coast", "swellnet": "mooloolaba"},
+    {"name": "Maroochydore",       "region": "Sunshine Coast", "swellnet": "maroochydore"},
+    {"name": "Kings Beach",        "region": "Sunshine Coast", "swellnet": "kings-beach"},
+    {"name": "Caloundra",          "region": "Sunshine Coast", "swellnet": "caloundra"},
+]
+
+# ---------------------------------------------------------------------------
+# Surf spot catalogue (used in Forecast tab)
 # ---------------------------------------------------------------------------
 
 SURF_SPOTS = {
@@ -30,47 +65,6 @@ SURF_SPOTS = {
         {"name": "Lennox Head", "lat": -28.797, "lon": 153.588, "orientation": 60, "break_type": "Point"},
         {"name": "Ballina", "lat": -28.871, "lon": 153.563, "orientation": 90, "break_type": "Beach"},
     ],
-}
-
-# ---------------------------------------------------------------------------
-# Webcam catalogue
-# Embed sources: YouTube iframe where a public live cam exists, Swellnet page
-# link for all spots (free low-res preview, no account required to view).
-# Update the "youtube" ID when a better 24/7 stream is found.
-# ---------------------------------------------------------------------------
-
-WEBCAMS = {
-    "Snapper Rocks": {
-        "youtube": "VbnLxUlT4io",
-        "swellnet": "https://www.swellnet.com/surfcams/snapper-rocks",
-    },
-    "Kirra Beach": {
-        "swellnet": "https://www.swellnet.com/surfcams/kirra",
-    },
-    "Burleigh Heads": {
-        "swellnet": "https://www.swellnet.com/surfcams/burleigh-heads",
-    },
-    "Coolangatta Beach": {
-        "swellnet": "https://www.swellnet.com/surfcams/coolangatta",
-    },
-    "Noosa Heads": {
-        "swellnet": "https://www.swellnet.com/surfcams/noosa-heads",
-    },
-    "Mooloolaba Beach": {
-        "swellnet": "https://www.swellnet.com/surfcams/mooloolaba",
-    },
-    "Maroochydore": {
-        "swellnet": "https://www.swellnet.com/surfcams/maroochydore",
-    },
-    "Byron Bay \u2013 The Pass": {
-        "swellnet": "https://www.swellnet.com/surfcams/byron-bay",
-    },
-    "Lennox Head": {
-        "swellnet": "https://www.swellnet.com/surfcams/lennox-head",
-    },
-    "Ballina": {
-        "swellnet": "https://www.swellnet.com/surfcams/ballina",
-    },
 }
 
 # ---------------------------------------------------------------------------
