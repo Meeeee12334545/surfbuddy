@@ -316,16 +316,21 @@ def _cam_card_html(cam: dict) -> str:
     </div>"""
 
 
+_GALLERY_COLS = 3       # cards per row
+_CARD_HEIGHT_PX = 275  # approximate height of one card row including gap
+_GALLERY_PAD_PX = 40   # top/bottom padding allowance
+
+
 def build_cam_gallery(cams: list) -> tuple:
     """Return (html_string, height_px) for the responsive cam card grid."""
-    n_rows = math.ceil(len(cams) / 3)
-    height = n_rows * 275 + 40
+    n_rows = math.ceil(len(cams) / _GALLERY_COLS)
+    height = n_rows * _CARD_HEIGHT_PX + _GALLERY_PAD_PX
     cards = "\n".join(_cam_card_html(c) for c in cams)
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{background:transparent;padding:4px 2px 8px}}
-  .grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}}
+  .grid{{display:grid;grid-template-columns:repeat({_GALLERY_COLS},1fr);gap:16px}}
 </style></head>
 <body><div class="grid">{cards}</div></body></html>"""
     return html, height
