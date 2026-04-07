@@ -14,41 +14,20 @@ import streamlit.components.v1 as components
 from streamlit_js_eval import get_geolocation
 
 # ---------------------------------------------------------------------------
-# GCCC Live Camera Catalogue
-# Direct HLS streams from Gold Coast City Council CloudFront distribution.
-# URL pattern:  HLS_BASE/{stream}.stream/playlist.m3u8
+# Live Camera Catalogue – only cams with confirmed HLS streams
 # ---------------------------------------------------------------------------
 
 HLS_BASE = "https://d1nm4r8e5x1rwd.cloudfront.net/cw"
-GCCC_PAGE = "https://www.goldcoast.qld.gov.au/Things-to-do/Gold-Coast-beaches/Beach-cameras"
 
-# South → North ordering so the gallery reads geographically
+# South → North ordering
 SEQ_CAMS = [
-    # ── Gold Coast – confirmed GCCC direct HLS streams ──────────────────────
-    {"name": "Rainbow Bay",         "region": "Gold Coast", "stream": "rainbowbaycamera",          "lat": -28.168, "lon": 153.546},
-    {"name": "Greenmount",          "region": "Gold Coast", "stream": "rainbowbaycamera",          "lat": -28.165, "lon": 153.544},
-    {"name": "Kirra",               "region": "Gold Coast", "stream": "kirracamera",               "lat": -28.162, "lon": 153.544},
-    {"name": "Tugun / Bilinga",     "region": "Gold Coast", "stream": "tuguncamera",               "lat": -28.145, "lon": 153.527},
-    {"name": "Palm Beach",          "region": "Gold Coast", "stream": "currumbincamera",           "lat": -28.118, "lon": 153.472},
-    {"name": "Burleigh Heads",      "region": "Gold Coast", "stream": "burleighhighcamera",        "lat": -28.085, "lon": 153.453},
-    {"name": "Miami Beach",         "region": "Gold Coast", "stream": "miamicamera",               "lat": -28.056, "lon": 153.440},
-    {"name": "Northcliffe",         "region": "Gold Coast", "stream": "surfersparadisehighcamera", "lat": -27.998, "lon": 153.428},
-    {"name": "Narrowneck",          "region": "Gold Coast", "stream": "narrowneckhighcamera",      "lat": -27.984, "lon": 153.431},
-    {"name": "Main Beach",          "region": "Gold Coast", "stream": "mainbeachcamera",           "lat": -27.971, "lon": 153.431},
-    # ── Gold Coast – GCCC page link (stream slug not yet confirmed) ──────────
-    {"name": "Snapper Rocks",       "region": "Gold Coast", "lat": -28.166, "lon": 153.546},
-    {"name": "Coolangatta Beach",   "region": "Gold Coast", "lat": -28.163, "lon": 153.545},
-    {"name": "Currumbin Alley",     "region": "Gold Coast", "lat": -28.158, "lon": 153.498},
-    {"name": "Mermaid Beach",       "region": "Gold Coast", "lat": -28.038, "lon": 153.432},
-    {"name": "Broadbeach",          "region": "Gold Coast", "lat": -28.023, "lon": 153.429},
-    {"name": "Surfers Paradise",    "region": "Gold Coast", "lat": -27.998, "lon": 153.428},
-    # ── Sunshine Coast ───────────────────────────────────────────────────────
-    {"name": "Caloundra",           "region": "Sunshine Coast", "cam_url": "https://surfsunshinecoast.com.au/surf-cams/",                                 "lat": -26.800, "lon": 153.142},
-    {"name": "Mooloolaba",          "region": "Sunshine Coast", "cam_url": "https://surfsunshinecoast.com.au/surf-cams/",                                 "lat": -26.681, "lon": 153.119},
-    {"name": "Alexandra Headland",  "region": "Sunshine Coast", "cam_url": "https://surfsunshinecoast.com.au/surf-cams/",                                 "lat": -26.668, "lon": 153.113},
-    {"name": "Coolum Beach",        "region": "Sunshine Coast", "cam_url": "https://surfsunshinecoast.com.au/surf-cams/",                                 "lat": -26.532, "lon": 153.088},
-    {"name": "Sunshine Beach",      "region": "Sunshine Coast", "cam_url": "https://noosasurfcam.com/sunshine-beach-surf-cam.html",                      "lat": -26.410, "lon": 153.093},
-    {"name": "Noosa Heads",         "region": "Sunshine Coast", "cam_url": "https://noosasurfcam.com/",                                                  "lat": -26.392, "lon": 153.091},
+    {"name": "Currumbin Alley",  "region": "Gold Coast", "stream": "rainbowbaycamera",       "lat": -28.158, "lon": 153.498},
+    {"name": "Tugun",            "region": "Gold Coast", "stream": "tallebudgeracamera",      "lat": -28.145, "lon": 153.527},
+    {"name": "Palm Beach South", "region": "Gold Coast", "stream": "palmbeachqldcamera",      "lat": -28.118, "lon": 153.472},
+    {"name": "Tallebudgera",     "region": "Gold Coast", "stream": "tallebudgeracamera",      "lat": -28.075, "lon": 153.440},
+    {"name": "Miami",            "region": "Gold Coast", "stream": "miamicamera",             "lat": -28.056, "lon": 153.440},
+    {"name": "Surfers Paradise", "region": "Gold Coast", "stream": "surfersparadisecamera",   "lat": -27.998, "lon": 153.428},
+    {"name": "The Spit North",   "region": "Gold Coast", "stream": "seawayspitcamera",        "lat": -27.957, "lon": 153.431},
 ]
 
 # ---------------------------------------------------------------------------
@@ -319,59 +298,43 @@ _GALLERY_PAD_PX = 40
 def _cam_card_html(cam: dict, idx: int) -> str:
     name         = cam["name"]
     region       = cam["region"]
-    badge_color  = "#c1440e" if region == "Gold Coast" else "#1a7a4a"
+    badge_color  = "#e07020" if region == "Gold Coast" else "#1a7a4a"
+    stream_url   = f"{HLS_BASE}/{cam['stream']}.stream/playlist.m3u8"
 
-    if cam.get("stream"):
-        stream_url = f"{HLS_BASE}/{cam['stream']}.stream/playlist.m3u8"
-        media_html = f"""
-        <div style="position:relative;">
-          <span style="position:absolute;top:8px;left:8px;z-index:10;
-                       background:#e63946;color:white;font-size:0.62rem;
-                       font-weight:700;padding:2px 8px;border-radius:4px;
-                       letter-spacing:0.08em;pointer-events:none;">&#9679; LIVE</span>
-          <video id="cam{idx}" data-src="{stream_url}"
-                 muted playsinline controls
-                 style="width:100%;height:190px;background:#000;display:block;object-fit:cover;">
-          </video>
-        </div>"""
-        action = ('<span style="background:#00cc44;color:#001a0a;padding:6px 12px;'
-                  'border-radius:6px;font-size:0.72rem;font-weight:700;">✅ Direct Stream</span>')
-    else:
-        link_url  = cam.get("cam_url", GCCC_PAGE)
-        btn_label = "🎥 Watch Free" if cam.get("cam_url") else "🎥 GCCC Live Cam"
-        gradient  = (
-            "linear-gradient(150deg,#023e8a 0%,#0096c7 55%,#48cae4 100%)"
-            if region == "Gold Coast"
-            else "linear-gradient(150deg,#1b4332 0%,#2d9596 55%,#48cae4 100%)"
-        )
-        media_html = f"""
-        <div style="height:190px;background:{gradient};display:flex;flex-direction:column;
-                    align-items:center;justify-content:center;color:white;">
-          <div style="font-size:2.6rem;line-height:1">🌊</div>
-          <div style="font-size:0.78rem;margin-top:10px;opacity:0.85;
-                      text-align:center;padding:0 14px;">
-            Click <strong>{btn_label.split()[-1]}</strong> below to view live
-          </div>
-        </div>"""
-        action = (f'<a href="{link_url}" target="_blank" rel="noopener"'
-                  f' style="background:#0077b6;color:white;padding:7px 14px;'
-                  f'border-radius:7px;font-size:0.78rem;text-decoration:none;'
-                  f'font-weight:700;white-space:nowrap;">{btn_label}</a>')
+    media_html = f"""
+    <div style="position:relative;" id="wrap{idx}">
+      <span style="position:absolute;top:8px;left:8px;z-index:10;
+                   background:#e63946;color:white;font-size:0.62rem;
+                   font-weight:700;padding:2px 8px;border-radius:4px;
+                   letter-spacing:0.08em;pointer-events:none;">&#9679; LIVE</span>
+      <button onclick="goFS({idx})"
+              style="position:absolute;top:8px;right:8px;z-index:10;
+                     background:rgba(0,0,0,0.55);color:white;border:none;
+                     border-radius:4px;padding:3px 7px;font-size:0.75rem;
+                     cursor:pointer;line-height:1.4;" title="Full screen">⛶</button>
+      <video id="cam{idx}" data-src="{stream_url}"
+             muted playsinline controls
+             style="width:100%;height:190px;background:#000;display:block;object-fit:cover;">
+      </video>
+    </div>"""
 
     return f"""
-    <div style="border-radius:12px;overflow:hidden;background:#0f1e2e;
-                box-shadow:0 4px 16px rgba(0,0,0,0.4);">
+    <div style="border-radius:12px;overflow:hidden;background:#ffffff;
+                box-shadow:0 2px 10px rgba(0,0,0,0.12);border:1px solid #dde3eb;">
       {media_html}
       <div style="padding:10px 12px;display:flex;justify-content:space-between;
                   align-items:center;gap:6px;">
         <div style="min-width:0;flex:1;">
-          <div style="color:#e8f4fd;font-weight:700;font-size:0.9rem;
+          <div style="color:#1a2332;font-weight:700;font-size:0.9rem;
                       white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{name}</div>
           <span style="display:inline-block;margin-top:3px;background:{badge_color};
                        color:white;font-size:0.62rem;font-weight:700;padding:2px 8px;
                        border-radius:4px;letter-spacing:0.04em;">{region.upper()}</span>
         </div>
-        <div style="flex-shrink:0;">{action}</div>
+        <div style="flex-shrink:0;">
+          <span style="background:#dcf5e7;color:#1a7a4a;padding:6px 12px;
+                       border-radius:6px;font-size:0.72rem;font-weight:700;">✅ Live Stream</span>
+        </div>
       </div>
     </div>"""
 
@@ -406,8 +369,8 @@ function initHLS(id, url) {{
     hls.attachMedia(v);
     hls.on(Hls.Events.ERROR, function(e, d) {{
       if (d.fatal) {{
-        v.parentElement.innerHTML = '<div style="height:190px;background:#1a0010;'
-          + 'display:flex;align-items:center;justify-content:center;color:#ff8080;'
+        v.parentElement.innerHTML = '<div style="height:190px;background:#fdecea;'
+          + 'display:flex;align-items:center;justify-content:center;color:#c0392b;'
           + 'font-size:0.8rem;text-align:center;padding:1rem;">'
           + '⚠️ Stream temporarily<br>unavailable</div>';
       }}
@@ -415,6 +378,13 @@ function initHLS(id, url) {{
   }} else if (v.canPlayType('application/vnd.apple.mpegurl')) {{
     v.src = url;
   }}
+}}
+function goFS(idx) {{
+  var wrap = document.getElementById('wrap' + idx);
+  var el = wrap || document.getElementById('cam' + idx);
+  if (!el) return;
+  var req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+  if (req) req.call(el);
 }}
 {hls_inits}
 </script>
@@ -430,39 +400,39 @@ st.set_page_config(page_title="Surf Buddy 🏄", page_icon="🏄", layout="wide"
 
 st.markdown("""
 <style>
-  .stApp { background-color: #0a1628; color: #e8f4fd; }
-  [data-testid="stSidebar"] { background-color: #0f1e2e; border-right: 1px solid #1e3a5c; }
+  .stApp { background-color: #f5f7fa; color: #1a2332; }
+  [data-testid="stSidebar"] { background-color: #eef2f7; border-right: 1px solid #d0d8e4; }
   [data-testid="stMetric"] {
-    background: #0f1e2e; border: 1px solid #1e3a5c;
+    background: #ffffff; border: 1px solid #d0d8e4;
     border-radius: 10px; padding: 14px 18px;
   }
-  [data-testid="stMetricValue"] { color: #e8f4fd !important; }
-  [data-testid="stMetricLabel"] { color: #90caf9 !important; }
-  h1 { font-size: 2rem !important; font-weight: 700 !important; color: #e8f4fd !important; }
-  h2, h3 { color: #e8f4fd !important; font-weight: 600 !important; }
-  p, li, .stMarkdown { color: #b0c8e0 !important; }
-  [data-testid="stTabs"] button { font-weight: 600; color: #90caf9 !important; }
+  [data-testid="stMetricValue"] { color: #1a2332 !important; }
+  [data-testid="stMetricLabel"] { color: #4a6080 !important; }
+  h1 { font-size: 2rem !important; font-weight: 700 !important; color: #1a2332 !important; }
+  h2, h3 { color: #1a2332 !important; font-weight: 600 !important; }
+  p, li, .stMarkdown { color: #3a5068 !important; }
+  [data-testid="stTabs"] button { font-weight: 600; color: #4a6080 !important; }
   [data-testid="stTabs"] button[aria-selected="true"] {
-    color: #48cae4 !important; border-bottom-color: #48cae4 !important;
+    color: #0077b6 !important; border-bottom-color: #0077b6 !important;
   }
-  .stCaption { color: #5a8aa8 !important; }
-  hr { border-color: #1e3a5c !important; }
-  [data-testid="stRadio"] label { color: #b0c8e0 !important; }
-  .stDataFrame { background: #0f1e2e; }
-  [data-testid="stSuccess"] { background: #0d2b1a !important; border-color: #1a7a4a !important; }
-  [data-testid="stSuccess"] p { color: #6fcf97 !important; }
-  [data-testid="stExpander"] { background: #0f1e2e !important; border-color: #1e3a5c !important; }
-  [data-testid="stInfo"] { background: #0a1e38 !important; border-color: #1e3a5c !important; }
-  [data-testid="stInfo"] p { color: #90caf9 !important; }
+  .stCaption { color: #7a95ae !important; }
+  hr { border-color: #d0d8e4 !important; }
+  [data-testid="stRadio"] label { color: #3a5068 !important; }
+  .stDataFrame { background: #ffffff; }
+  [data-testid="stSuccess"] { background: #edfaf3 !important; border-color: #1a7a4a !important; }
+  [data-testid="stSuccess"] p { color: #1a5c38 !important; }
+  [data-testid="stExpander"] { background: #ffffff !important; border-color: #d0d8e4 !important; }
+  [data-testid="stInfo"] { background: #e8f4fd !important; border-color: #90c8f0 !important; }
+  [data-testid="stInfo"] p { color: #1a4a6e !important; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── Header ──────────────────────────────────────────────────────────────────
 st.markdown("""
 <div style="padding:12px 0 4px">
-  <span style="font-size:2.2rem;font-weight:800;color:#e8f4fd;">🏄 Surf Buddy</span>
-  <span style="font-size:0.95rem;color:#5a8aa8;margin-left:12px;">
-    SEQ Live Cams · Forecast · Near-Me Rankings
+  <span style="font-size:2.2rem;font-weight:800;color:#1a2332;">🏄 Surf Buddy</span>
+  <span style="font-size:0.95rem;color:#7a95ae;margin-left:12px;">
+    Gold Coast Live Cams · Forecast · Near-Me Rankings
   </span>
 </div>
 """, unsafe_allow_html=True)
@@ -510,33 +480,15 @@ tab_cams, tab_nearme, tab_forecast = st.tabs([
 # TAB 1 – LIVE CAMS GALLERY
 # ============================================================================
 with tab_cams:
-    gc_direct = sum(1 for c in SEQ_CAMS if c["region"] == "Gold Coast" and c.get("stream"))
-    gc_total  = sum(1 for c in SEQ_CAMS if c["region"] == "Gold Coast")
-    sc_total  = sum(1 for c in SEQ_CAMS if c["region"] == "Sunshine Coast")
-
     st.markdown(
-        f'<p style="color:#5a8aa8;font-size:0.85rem;margin:-4px 0 12px">'
-        f'<strong style="color:#00cc44">&#9679; {gc_direct} direct live streams</strong> embedded '
-        f'from <strong style="color:#90caf9">Gold Coast City Council (GCCC)</strong> cameras — '
-        f'no login, no subscription. Other spots link to their free cam pages.</p>',
+        f'<p style="color:#4a6080;font-size:0.85rem;margin:-4px 0 12px">'
+        f'<strong style="color:#1a7a4a">&#9679; {len(SEQ_CAMS)} live streams</strong> — '
+        f'Gold Coast City Council (GCCC) direct HLS feeds. '
+        f'Press <strong>⛶</strong> on any camera to go full screen.</p>',
         unsafe_allow_html=True,
     )
 
-    region_filter = st.radio(
-        "Filter:",
-        [f"🌏 All SEQ ({len(SEQ_CAMS)})",
-         f"🟠 Gold Coast ({gc_total})",
-         f"🟢 Sunshine Coast ({sc_total})"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-
-    if "Gold Coast" in region_filter:
-        visible_cams = [c for c in SEQ_CAMS if c["region"] == "Gold Coast"]
-    elif "Sunshine Coast" in region_filter:
-        visible_cams = [c for c in SEQ_CAMS if c["region"] == "Sunshine Coast"]
-    else:
-        visible_cams = SEQ_CAMS
+    visible_cams = SEQ_CAMS
 
     gallery_html, gallery_height = build_cam_gallery(visible_cams)
     components.html(gallery_html, height=gallery_height, scrolling=False)
@@ -602,10 +554,10 @@ with tab_nearme:
             st.markdown(f"""
 <div style="background:{hero_color}22;border:2px solid {hero_color};border-radius:14px;
             padding:18px 24px;margin-bottom:16px;">
-  <div style="font-size:1.6rem;font-weight:800;color:#e8f4fd;">
+  <div style="font-size:1.6rem;font-weight:800;color:#1a2332;">
     🏆 Go to <span style="color:{hero_color}">{top['Spot']}</span>
   </div>
-  <div style="color:#b0c8e0;margin-top:6px;font-size:0.95rem;">
+  <div style="color:#3a5068;margin-top:6px;font-size:0.95rem;">
     {top['Rating']} &nbsp;·&nbsp; Score <strong style="color:{hero_color}">{top['Score']}/10</strong>
     &nbsp;·&nbsp; {top['Break']} break
     &nbsp;·&nbsp; {top['Dist (km)']} km away
@@ -691,13 +643,13 @@ with tab_forecast:
   {score_label(now_score)} &nbsp;|&nbsp; Score: {now_score} / 10
   &nbsp;·&nbsp; {spot['break_type']} Break
 </div>
-<div style="background:#0f1e2e;border:1px solid #1e3a5c;border-radius:8px;
+<div style="background:#ffffff;border:1px solid #d0d8e4;border-radius:8px;
             padding:10px 20px;margin-top:6px;display:flex;gap:24px;flex-wrap:wrap;
-            font-size:0.85rem;color:#b0c8e0;">
-  <span>Wind quality: <strong style="color:#e8f4fd">
+            font-size:0.85rem;color:#3a5068;">
+  <span>Wind quality: <strong style="color:#1a2332">
     {wind_relation(row['winddirection_10m'], spot['orientation'])}</strong></span>
-  <span>Chop: <strong style="color:#e8f4fd">{ww_h:.1f} m wind swell</strong></span>
-  <span>Swell direction: <strong style="color:#e8f4fd">
+  <span>Chop: <strong style="color:#1a2332">{ww_h:.1f} m wind swell</strong></span>
+  <span>Swell direction: <strong style="color:#1a2332">
     {compass(swell_d)} — {_swell_dir_score(swell_d, spot['orientation']):.0f}/10 for this break</strong></span>
 </div>
 """, unsafe_allow_html=True)
@@ -729,8 +681,8 @@ with tab_forecast:
     ])
 
     chart_layout = dict(
-        paper_bgcolor="#0a1628", plot_bgcolor="#0f1e2e",
-        font_color="#b0c8e0", hovermode="x unified",
+        paper_bgcolor="#f5f7fa", plot_bgcolor="#ffffff",
+        font_color="#3a5068", hovermode="x unified",
     )
 
     with fc1:
@@ -781,7 +733,7 @@ with tab_forecast:
             labels={"wave_direction": "Swell Dir (°)", r_col: "Swell (m)", "score": "Score"})
         fig4.update_layout(
             polar=dict(angularaxis=dict(direction="clockwise", rotation=90)),
-            paper_bgcolor="#0a1628", font_color="#b0c8e0")
+            paper_bgcolor="#f5f7fa", font_color="#3a5068")
         st.plotly_chart(fig4, use_container_width=True)
 
     with fc5:
