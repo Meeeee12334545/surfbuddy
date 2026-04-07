@@ -414,6 +414,80 @@ def _safe_col(row, col, fallback=None):
 
 
 # ---------------------------------------------------------------------------
+# Travel-time calculator + "grab your board" messaging
+# ---------------------------------------------------------------------------
+
+# Average coastal road speed used for drive-time estimates (km/h)
+_DRIVE_SPEED_KMH = 60
+# Wax-up / gear prep time added on top of the drive (minutes)
+_PREP_MINS = 20
+
+
+def travel_time_mins(dist_km: float) -> int:
+    """Return estimated one-way drive time in whole minutes."""
+    return max(5, round((dist_km / _DRIVE_SPEED_KMH) * 60))
+
+
+def leave_by_time(best_wave_time: pd.Timestamp, dist_km: float) -> pd.Timestamp:
+    """Return the timestamp you need to walk out the door by."""
+    return best_wave_time - pd.Timedelta(minutes=travel_time_mins(dist_km) + _PREP_MINS)
+
+
+def go_surf_msg(score: float, spot_name: str, best_time: pd.Timestamp,
+                leave_time: pd.Timestamp, drive_mins: int) -> str:
+    """
+    Generate a fun, surf-culture 'go surf' call-to-action.
+    Returns an HTML string ready for st.markdown(unsafe_allow_html=True).
+    """
+    time_str  = best_time.strftime("%H:%M")
+    leave_str = leave_time.strftime("%H:%M")
+    hour      = leave_time.hour
+    day_str   = leave_time.strftime("%A")
+
+    # Time-of-day flavour
+    if hour < 7:
+        sesh_vibe = "dawn patrol 🌅"
+    elif hour < 10:
+        sesh_vibe = "morning sesh 🌤️"
+    elif hour < 14:
+        sesh_vibe = "midday rip ☀️"
+    elif hour < 17:
+        sesh_vibe = "arvo sesh 🌊"
+    else:
+        sesh_vibe = "sunset sesh 🌇"
+
+    drive_str = f"{drive_mins} min drive" if drive_mins >= 10 else "just around the corner"
+
+    if score >= 9.0:
+        headline = f"🔥 This is FIRING — it's going OFF at {spot_name}!"
+        cta      = (f"Drop everything. Grab your board, slap on some wax and "
+                    f"<strong>be out the door by {leave_str}</strong>. "
+                    f"It's a {drive_str} to be at the peak by {time_str}. DO NOT miss this {sesh_vibe}. 🤙")
+    elif score >= 7.5:
+        headline = f"⭐ {spot_name} is pumping — {sesh_vibe} is on!"
+        cta      = (f"Grab your board and towel, double-check the wax and "
+                    f"<strong>be out the door by {leave_str}</strong>. "
+                    f"It's a {drive_str}, and the waves are waiting by {time_str}. Get some! 🏄")
+    elif score >= 6.0:
+        headline = f"✅ Solid surf at {spot_name} — worth the trip!"
+        cta      = (f"Pack your board and a dry towel and "
+                    f"<strong>leave by {leave_str}</strong> on {day_str}. "
+                    f"It's a {drive_str} for a {time_str} splash. You won't regret it. 🤙")
+    elif score >= 4.5:
+        headline = f"🟡 {spot_name} — average but rideable."
+        cta      = (f"If you're keen, pack your gear and "
+                    f"<strong>aim to leave by {leave_str}</strong>. "
+                    f"It's a {drive_str} to make the {time_str} window. Manage your expectations 😄")
+    else:
+        headline = f"🟠 {spot_name} — marginal at best."
+        cta      = (f"Honestly, the couch is calling 🛋️ But if you're desperate, "
+                    f"<strong>leave by {leave_str}</strong> ({drive_str}, "
+                    f"peaking around {time_str}).")
+
+    return headline, cta
+
+
+# ---------------------------------------------------------------------------
 # Cam gallery helpers  (iframe-safe HTML rendering)
 # ---------------------------------------------------------------------------
 
@@ -710,17 +784,17 @@ tab_cams, tab_nearme, tab_forecast = st.tabs([
 # ============================================================================
 with tab_cams:
     st.markdown(
-        f'<p style="color:#4a6080;font-size:0.85rem;margin:-4px 0 12px">'
-        f'<strong style="color:#1a7a4a">&#9679; {len(SEQ_CAMS)} live streams</strong> — '
+        f'<p style="color:#64748b;font-size:0.88rem;margin:0 0 14px">'
+        f'<strong style="color:#059669">● {len(SEQ_CAMS)} live streams</strong> — '
         f'Gold Coast City Council (GCCC) direct HLS feeds. '
-        f'Press <strong>⛶</strong> on any camera to go full screen.</p>',
+        f'Tap <strong>⛶</strong> on any camera to go full screen.</p>',
         unsafe_allow_html=True,
     )
 
     visible_cams = SEQ_CAMS
 
     gallery_html, gallery_height = build_cam_gallery(visible_cams)
-    components.html(gallery_html, height=gallery_height, scrolling=False)
+    render_html_safe(gallery_html, height=gallery_height, scrolling=False)
 
 # ============================================================================
 # TAB 2 – NEAR ME
@@ -728,8 +802,8 @@ with tab_cams:
 with tab_nearme:
     st.subheader(f"📍 Best Surf Near You  ·  {loc_source} location")
     st.caption(
-        f"Ranked by surf score right now, within 200 km of your position "
-        f"({user_lat:.3f}°, {user_lon:.3f}°)."
+        f"Ranked by surf score right now · within {MAX_DISTANCE_KM} km of "
+        f"({user_lat:.3f}°, {user_lon:.3f}°) · drive times assume {_DRIVE_SPEED_KMH} km/h avg"
     )
 
     near_rows = []
@@ -747,21 +821,23 @@ with tab_nearme:
                 s["orientation"], s["break_type"],
                 _safe_col(srow, "wind_wave_height", 0.0),
             )
-            dist_km = haversine_km(user_lat, user_lon, s["lat"], s["lon"])
+            dist_km  = haversine_km(user_lat, user_lon, s["lat"], s["lon"])
+            drive    = travel_time_mins(dist_km)
             near_rows.append({
-                "Spot":      s["name"],
-                "Region":    s["region"],
-                "Break":     s["break_type"],
-                "Dist (km)": round(dist_km, 1),
-                "Wave (m)":  round(srow["wave_height"], 1),
-                "Swell (m)": round(_safe_col(srow, "swell_wave_height", srow["wave_height"]), 1),
-                "Period (s)":round(_safe_col(srow, "swell_wave_period", srow["wave_period"]), 0),
-                "Wind":      f"{srow['windspeed_10m']:.0f} km/h {compass(srow['winddirection_10m'])}",
-                "Wind qlty": wind_relation(srow["winddirection_10m"], s["orientation"]),
-                "Score":     sc,
-                "Rating":    score_label(sc),
-                "_lat":      s["lat"],
-                "_lon":      s["lon"],
+                "Spot":       s["name"],
+                "Region":     s["region"],
+                "Break":      s["break_type"],
+                "Dist (km)":  round(dist_km, 1),
+                "Drive (min)":drive,
+                "Wave (m)":   round(srow["wave_height"], 1),
+                "Swell (m)":  round(_safe_col(srow, "swell_wave_height", srow["wave_height"]), 1),
+                "Period (s)": round(_safe_col(srow, "swell_wave_period", srow["wave_period"]), 0),
+                "Wind":       f"{srow['windspeed_10m']:.0f} km/h {compass(srow['winddirection_10m'])}",
+                "Wind qlty":  wind_relation(srow["winddirection_10m"], s["orientation"]),
+                "Score":      sc,
+                "Rating":     score_label(sc),
+                "_lat":       s["lat"],
+                "_lon":       s["lon"],
             })
         except Exception:
             pass
@@ -778,20 +854,54 @@ with tab_nearme:
 
         # ── Top pick hero card ───────────────────────────────────────────────
         if not near_df.empty:
-            top = near_df.iloc[0]
+            top        = near_df.iloc[0]
             hero_color = score_color(top["Score"])
+            drive_mins = int(top["Drive (min)"])
+            # Best window for the top spot to give an accurate leave time
+            try:
+                top_spot_obj = next(s for s in ALL_SPOTS if s["name"] == top["Spot"])
+                top_df       = get_forecast(top_spot_obj["lat"], top_spot_obj["lon"])
+                top_best5    = best_window(top_df, top_spot_obj)
+                best_wave    = top_best5.iloc[0]["time"] if not top_best5.empty else (
+                    pd.Timestamp.now(tz="Australia/Sydney") + pd.Timedelta(hours=1))
+            except Exception:
+                best_wave = pd.Timestamp.now(tz="Australia/Sydney") + pd.Timedelta(hours=1)
+
+            leave_t    = leave_by_time(best_wave, top["Dist (km)"])
+            headline, cta = go_surf_msg(
+                top["Score"], top["Spot"], best_wave, leave_t, drive_mins
+            )
+
             st.markdown(f"""
-<div style="background:{hero_color}22;border:2px solid {hero_color};border-radius:14px;
-            padding:18px 24px;margin-bottom:16px;">
-  <div style="font-size:1.6rem;font-weight:800;color:#1a2332;">
-    🏆 Go to <span style="color:{hero_color}">{top['Spot']}</span>
+<div style="background:linear-gradient(135deg,{hero_color}18,{hero_color}08);
+            border:2px solid {hero_color};border-radius:18px;
+            padding:22px 26px;margin-bottom:20px;
+            box-shadow:0 4px 20px {hero_color}25;">
+  <div style="font-size:1.45rem;font-weight:800;color:#0f172a;margin-bottom:8px;">
+    {headline}
   </div>
-  <div style="color:#3a5068;margin-top:6px;font-size:0.95rem;">
-    {top['Rating']} &nbsp;·&nbsp; Score <strong style="color:{hero_color}">{top['Score']}/10</strong>
-    &nbsp;·&nbsp; {top['Break']} break
-    &nbsp;·&nbsp; {top['Dist (km)']} km away
-    &nbsp;·&nbsp; {top['Swell (m)']}m swell @ {top['Period (s)']:.0f}s
-    &nbsp;·&nbsp; Wind {top['Wind']} {top['Wind qlty']}
+  <div style="background:rgba(255,255,255,0.85);border-radius:12px;
+              padding:14px 18px;margin:10px 0;font-size:0.98rem;
+              color:#1e293b;line-height:1.6;">
+    🏄 {cta}
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;">
+    <span style="background:{hero_color};color:white;padding:5px 14px;
+                 border-radius:8px;font-size:0.88rem;font-weight:700;">
+      Score {top['Score']}/10 · {top['Rating']}
+    </span>
+    <span style="background:#f1f5f9;color:#475569;padding:5px 14px;
+                 border-radius:8px;font-size:0.88rem;font-weight:600;">
+      🚗 {drive_mins} min · {top['Dist (km)']} km
+    </span>
+    <span style="background:#f1f5f9;color:#475569;padding:5px 14px;
+                 border-radius:8px;font-size:0.88rem;font-weight:600;">
+      🌊 {top['Swell (m)']}m swell @ {top['Period (s)']:.0f}s
+    </span>
+    <span style="background:#f1f5f9;color:#475569;padding:5px 14px;
+                 border-radius:8px;font-size:0.88rem;font-weight:600;">
+      💨 {top['Wind']} {top['Wind qlty']}
+    </span>
   </div>
 </div>""", unsafe_allow_html=True)
 
