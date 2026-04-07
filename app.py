@@ -830,7 +830,7 @@ def render_html_safe(html: str, height: int, scrolling: bool = False) -> None:
     """
     if hasattr(st, "iframe"):
         b64 = base64.b64encode(html.encode("utf-8")).decode("utf-8")
-        st.iframe(src=f"data:text/html;base64,{b64}", height=height, scrolling=scrolling)
+        st.iframe(src=f"data:text/html;base64,{b64}", height=height)
     else:
         import streamlit.components.v1 as _c
         _c.html(html, height=height, scrolling=scrolling)
