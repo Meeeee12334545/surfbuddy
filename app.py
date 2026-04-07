@@ -1,6 +1,9 @@
 import math
 from datetime import datetime
 
+MAX_CHOP_PENALTY = 0.20   # maximum scoring reduction from wind chop (20 %)
+MAX_DISTANCE_KM  = 200    # radius used for "Near Me" spot search
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -215,7 +218,7 @@ def surf_score(
     s = _swell_dir_score(float(wave_direction), orientation)
 
     ww, sw = float(wind_wave_height), float(wave_height)
-    chop_penalty = min(0.20, (ww / max(sw, 0.1)) * 0.20)  # up to –20 %
+    chop_penalty = min(MAX_CHOP_PENALTY, (ww / max(sw, 0.1)) * MAX_CHOP_PENALTY)
 
     bw = _BREAK_WEIGHTS.get(break_type, _BREAK_WEIGHTS["Beach"])
     raw = h * bw[0] + p * bw[1] + w * bw[2] + s * bw[3]
@@ -266,9 +269,13 @@ def wind_relation(wind_dir: float, orientation: float) -> str:
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    dlat       = math.radians(lat2 - lat1)
+    dlon       = math.radians(lon2 - lon1)
+    sin_dlat   = math.sin(dlat / 2)
+    sin_dlon   = math.sin(dlon / 2)
+    cos_lat1   = math.cos(math.radians(lat1))
+    cos_lat2   = math.cos(math.radians(lat2))
+    a = sin_dlat ** 2 + cos_lat1 * cos_lat2 * sin_dlon ** 2
     return R * 2 * math.asin(math.sqrt(a))
 
 
@@ -293,7 +300,7 @@ def best_window(df: pd.DataFrame, spot: dict) -> pd.DataFrame:
     return future.sort_values("score", ascending=False).head(5)
 
 
-def _safe(row, col, fallback=None):
+def _safe_col(row, col, fallback=None):
     """Safely read a column from a pandas Series, returning fallback if missing/NaN."""
     if col in row.index and pd.notna(row[col]):
         return row[col]
@@ -376,9 +383,7 @@ def build_cam_gallery(cams: list) -> tuple:
     cards  = "\n".join(_cam_card_html(c, i) for i, c in enumerate(cams))
 
     hls_inits = "\n".join(
-        "  initHLS('cam{i}', '{base}/{stream}.stream/playlist.m3u8');".format(
-            i=i, base=HLS_BASE, stream=c["stream"]
-        )
+        f"  initHLS('cam{i}', '{HLS_BASE}/{c['stream']}.stream/playlist.m3u8');"
         for i, c in enumerate(cams) if c.get("stream")
     )
 
@@ -554,12 +559,12 @@ with tab_nearme:
             sdf  = get_forecast(s["lat"], s["lon"])
             srow = current_row(sdf)
             sc   = surf_score(
-                _safe(srow, "swell_wave_height", srow["wave_height"]),
-                _safe(srow, "swell_wave_period", srow["wave_period"]),
-                _safe(srow, "swell_wave_direction", srow["wave_direction"]),
+                _safe_col(srow, "swell_wave_height", srow["wave_height"]),
+                _safe_col(srow, "swell_wave_period", srow["wave_period"]),
+                _safe_col(srow, "swell_wave_direction", srow["wave_direction"]),
                 srow["windspeed_10m"], srow["winddirection_10m"],
                 s["orientation"], s["break_type"],
-                _safe(srow, "wind_wave_height", 0.0),
+                _safe_col(srow, "wind_wave_height", 0.0),
             )
             dist_km = haversine_km(user_lat, user_lon, s["lat"], s["lon"])
             near_rows.append({
@@ -568,8 +573,8 @@ with tab_nearme:
                 "Break":     s["break_type"],
                 "Dist (km)": round(dist_km, 1),
                 "Wave (m)":  round(srow["wave_height"], 1),
-                "Swell (m)": round(_safe(srow, "swell_wave_height", srow["wave_height"]), 1),
-                "Period (s)":round(_safe(srow, "swell_wave_period", srow["wave_period"]), 0),
+                "Swell (m)": round(_safe_col(srow, "swell_wave_height", srow["wave_height"]), 1),
+                "Period (s)":round(_safe_col(srow, "swell_wave_period", srow["wave_period"]), 0),
                 "Wind":      f"{srow['windspeed_10m']:.0f} km/h {compass(srow['winddirection_10m'])}",
                 "Wind qlty": wind_relation(srow["winddirection_10m"], s["orientation"]),
                 "Score":     sc,
@@ -584,7 +589,7 @@ with tab_nearme:
     if near_rows:
         near_df = (
             pd.DataFrame(near_rows)
-            .query("`Dist (km)` <= 200")
+            .query(f"`Dist (km)` <= {MAX_DISTANCE_KM}")
             .sort_values("Score", ascending=False)
             .reset_index(drop=True)
         )
@@ -637,35 +642,35 @@ with tab_forecast:
                      "windspeed_10m", "winddirection_10m"]
     df["score"] = df.apply(
         lambda r: surf_score(
-            _safe(r, "swell_wave_height", r["wave_height"]),
-            _safe(r, "swell_wave_period",  r["wave_period"]),
-            _safe(r, "swell_wave_direction", r["wave_direction"]),
+            _safe_col(r, "swell_wave_height", r["wave_height"]),
+            _safe_col(r, "swell_wave_period",  r["wave_period"]),
+            _safe_col(r, "swell_wave_direction", r["wave_direction"]),
             r["windspeed_10m"], r["winddirection_10m"],
             spot["orientation"], spot["break_type"],
-            _safe(r, "wind_wave_height", 0.0),
+            _safe_col(r, "wind_wave_height", 0.0),
         ) if all(pd.notna(r[c]) for c in required_cols) else np.nan,
         axis=1,
     )
 
     row       = current_row(df)
     now_score = surf_score(
-        _safe(row, "swell_wave_height", row["wave_height"]),
-        _safe(row, "swell_wave_period",  row["wave_period"]),
-        _safe(row, "swell_wave_direction", row["wave_direction"]),
+        _safe_col(row, "swell_wave_height", row["wave_height"]),
+        _safe_col(row, "swell_wave_period",  row["wave_period"]),
+        _safe_col(row, "swell_wave_direction", row["wave_direction"]),
         row["windspeed_10m"], row["winddirection_10m"],
         spot["orientation"], spot["break_type"],
-        _safe(row, "wind_wave_height", 0.0),
+        _safe_col(row, "wind_wave_height", 0.0),
     )
 
     # ── Current conditions ───────────────────────────────────────────────────
     st.subheader(f"📡 {spot_name} — Right Now")
 
-    swell_h = _safe(row, "swell_wave_height", row["wave_height"])
-    swell_p = _safe(row, "swell_wave_period",  row["wave_period"])
-    swell_d = _safe(row, "swell_wave_direction", row["wave_direction"])
-    water_t = _safe(row, "sea_surface_temperature")
-    uv_val  = _safe(row, "uv_index")
-    ww_h    = _safe(row, "wind_wave_height", 0.0)
+    swell_h = _safe_col(row, "swell_wave_height", row["wave_height"])
+    swell_p = _safe_col(row, "swell_wave_period",  row["wave_period"])
+    swell_d = _safe_col(row, "swell_wave_direction", row["wave_direction"])
+    water_t = _safe_col(row, "sea_surface_temperature")
+    uv_val  = _safe_col(row, "uv_index")
+    ww_h    = _safe_col(row, "wind_wave_height", 0.0)
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("🌊 Wave Height",  f"{row['wave_height']:.1f} m")
@@ -807,19 +812,19 @@ with tab_forecast:
             sdf  = get_forecast(s["lat"], s["lon"])
             srow = current_row(sdf)
             sc   = surf_score(
-                _safe(srow, "swell_wave_height", srow["wave_height"]),
-                _safe(srow, "swell_wave_period",  srow["wave_period"]),
-                _safe(srow, "swell_wave_direction", srow["wave_direction"]),
+                _safe_col(srow, "swell_wave_height", srow["wave_height"]),
+                _safe_col(srow, "swell_wave_period",  srow["wave_period"]),
+                _safe_col(srow, "swell_wave_direction", srow["wave_direction"]),
                 srow["windspeed_10m"], srow["winddirection_10m"],
                 s["orientation"], s["break_type"],
-                _safe(srow, "wind_wave_height", 0.0),
+                _safe_col(srow, "wind_wave_height", 0.0),
             )
             rank_rows.append({
                 "Spot":       s["name"],
                 "Break":      s["break_type"],
                 "Wave (m)":   round(srow["wave_height"], 1),
-                "Swell (m)":  round(_safe(srow, "swell_wave_height", srow["wave_height"]), 1),
-                "Period (s)": round(_safe(srow, "swell_wave_period", srow["wave_period"]), 0),
+                "Swell (m)":  round(_safe_col(srow, "swell_wave_height", srow["wave_height"]), 1),
+                "Period (s)": round(_safe_col(srow, "swell_wave_period", srow["wave_period"]), 0),
                 "Wind":       f"{srow['windspeed_10m']:.0f} {compass(srow['winddirection_10m'])}",
                 "Wind qlty":  wind_relation(srow["winddirection_10m"], s["orientation"]),
                 "Score":      sc,
