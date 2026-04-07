@@ -1,7 +1,9 @@
+import base64
 import math
+import time
 from datetime import datetime
 
-MAX_CHOP_PENALTY = 0.20   # maximum scoring reduction from wind chop (20 %)
+MAX_CHOP_PENALTY = 0.30   # maximum scoring reduction from wind chop/swell contamination
 MAX_DISTANCE_KM  = 200    # radius used for "Near Me" spot search
 
 import numpy as np
@@ -10,7 +12,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 from streamlit_js_eval import get_geolocation
 
 # ---------------------------------------------------------------------------
@@ -80,6 +81,24 @@ MARINE_URL  = "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 
 
+def _fetch_with_retry(url: str, params: dict, max_retries: int = 3) -> requests.Response:
+    """HTTP GET with exponential back-off — handles 429 rate-limit errors gracefully."""
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            if r.status_code == 429 and attempt < max_retries - 1:
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+            r.raise_for_status()
+            return r
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                time.sleep(1.5)
+                continue
+            raise requests.exceptions.Timeout("Request timed out — please try again.")
+    raise Exception("Data service is busy. Please wait a moment and refresh.")
+
+
 @st.cache_data(ttl=900)
 def fetch_marine(lat: float, lon: float) -> pd.DataFrame:
     params = {
@@ -94,8 +113,7 @@ def fetch_marine(lat: float, lon: float) -> pd.DataFrame:
         "forecast_days": 7,
         "timezone": "Australia/Sydney",
     }
-    r = requests.get(MARINE_URL, params=params, timeout=10)
-    r.raise_for_status()
+    r = _fetch_with_retry(MARINE_URL, params)
     df = pd.DataFrame(r.json()["hourly"])
     df["time"] = pd.to_datetime(df["time"])
     return df
@@ -110,8 +128,7 @@ def fetch_weather(lat: float, lon: float) -> pd.DataFrame:
         "forecast_days": 7,
         "timezone": "Australia/Sydney",
     }
-    r = requests.get(WEATHER_URL, params=params, timeout=10)
-    r.raise_for_status()
+    r = _fetch_with_retry(WEATHER_URL, params)
     df = pd.DataFrame(r.json()["hourly"])
     df["time"] = pd.to_datetime(df["time"])
     return df
@@ -133,50 +150,122 @@ def get_ip_location() -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Improved surf scoring engine
+# Significantly improved surf scoring engine
 # ---------------------------------------------------------------------------
 
-def _wave_height_score(h: float) -> float:
-    """0–10. Sweet spot 0.8–2.5 m."""
-    if h < 0.3:  return 0.0
-    if h < 0.8:  return (h - 0.3) / 0.5 * 5
-    if h <= 2.5: return 10.0 - (h - 0.8) / 1.7 * 2
-    if h <= 4.0: return 8.0 - (h - 2.5) / 1.5 * 5
-    return max(0.0, 3.0 - (h - 4.0))
+def _wave_height_score(h: float, break_type: str = "Beach") -> float:
+    """
+    Score 0-10 based on wave height, calibrated per break type.
+    Point breaks thrive on larger, more powerful swells.
+    Beach breaks wash out when too big.
+    """
+    # (min_rideable, ideal_low, ideal_high, survivable_max)
+    ranges = {
+        "Point": (0.5, 1.0, 3.0, 5.5),
+        "Alley": (0.4, 0.8, 2.5, 4.5),
+        "Beach": (0.3, 0.6, 2.0, 4.0),
+    }
+    min_r, id_low, id_high, max_r = ranges.get(break_type, ranges["Beach"])
+    if h < 0.2:      return 0.0
+    if h < min_r:    return (h - 0.2) / (min_r - 0.2) * 3.0
+    if h < id_low:   return 3.0 + (h - min_r) / (id_low - min_r) * 7.0
+    if h <= id_high: return 10.0
+    if h <= max_r:   return 10.0 - (h - id_high) / (max_r - id_high) * 6.5
+    return max(0.0, 3.5 - (h - max_r) * 1.5)
 
 
 def _period_score(p: float) -> float:
-    """0–10. Sweet spot 10–16 s."""
-    if p < 5:   return 0.0
-    if p < 10:  return (p - 5) / 5 * 7
-    if p <= 16: return 10.0
-    return max(0.0, 10.0 - (p - 16) * 0.5)
+    """
+    Score 0-10 based on swell period.
+    Ground swell (>12 s) produces clean, powerful, well-organised waves.
+    Short-period wind swell (<8 s) = choppy and disorganised.
+    """
+    if p < 4:    return 0.0
+    if p < 7:    return (p - 4) / 3 * 3.0           # 4-7 s: poor wind swell
+    if p < 10:   return 3.0 + (p - 7) / 3 * 3.5     # 7-10 s: mixed/short period
+    if p < 13:   return 6.5 + (p - 10) / 3 * 2.5    # 10-13 s: decent ground swell
+    if p <= 18:  return 9.0 + (p - 13) / 5 * 1.0    # 13-18 s: quality ground swell
+    return 10.0                                        # >18 s: ultra-long period
 
 
 def _wind_score(speed: float, wind_dir: float, orientation: float) -> float:
-    """0–10. Offshore best, light best."""
-    offshore = (orientation + 180) % 360
-    diff = abs(wind_dir - offshore)
+    """
+    Score 0-10 based on wind speed and direction relative to the break.
+    Offshore + calm = glassy perfection. Onshore + strong = blown out.
+    """
+    offshore_dir = (orientation + 180) % 360
+    diff = abs(wind_dir - offshore_dir)
     if diff > 180: diff = 360 - diff
-    dir_factor   = max(0.0, 1.0 - diff / 180)
-    speed_factor = (1.0 if speed < 10 else
-                    1.0 - (speed - 10) / 20 if speed < 20 else
-                    max(0.0, 0.5 - (speed - 20) / 40))
-    return round(10 * dir_factor * speed_factor, 1)
+
+    # Direction component
+    if diff <= 30:    dir_score = 1.00
+    elif diff <= 60:  dir_score = 1.00 - (diff - 30) / 30 * 0.25   # 1.00 → 0.75
+    elif diff <= 90:  dir_score = 0.75 - (diff - 60) / 30 * 0.30   # 0.75 → 0.45
+    elif diff <= 120: dir_score = 0.45 - (diff - 90) / 30 * 0.25   # 0.45 → 0.20
+    elif diff <= 150: dir_score = 0.20 - (diff - 120) / 30 * 0.15  # 0.20 → 0.05
+    else:             dir_score = max(0.0, 0.05 - (diff - 150) / 30 * 0.05)
+
+    # Speed component: calm is ideal; offshore wind at moderate speed grooms the face
+    if speed < 5:    speed_mult = 1.05   # glassy bonus
+    elif speed < 12: speed_mult = 1.00
+    elif speed < 20: speed_mult = 1.00 - (speed - 12) / 8 * 0.25
+    elif speed < 30: speed_mult = 0.75 - (speed - 20) / 10 * 0.40
+    elif speed < 45: speed_mult = 0.35 - (speed - 30) / 15 * 0.30
+    else:            speed_mult = 0.05
+
+    # Offshore wind at moderate speed can actually help clean up the face
+    if diff < 45 and 5 < speed < 20:
+        speed_mult = max(speed_mult, 0.80)
+
+    return min(10.0, round(10 * dir_score * speed_mult, 1))
 
 
 def _swell_dir_score(wave_dir: float, orientation: float) -> float:
-    """0–10. Direct hit best."""
+    """
+    Score 0-10 based on swell direction vs break orientation.
+    Direct hit = 10, heavily angled = diminishing returns, blocked = 0.
+    """
     diff = abs(wave_dir - orientation)
     if diff > 180: diff = 360 - diff
-    return max(0.0, 10.0 - diff / 18)
+    if diff <= 15:   return 10.0
+    if diff <= 40:   return 10.0 - (diff - 15) / 25 * 2.0    # 10 → 8
+    if diff <= 70:   return 8.0  - (diff - 40) / 30 * 3.5    # 8 → 4.5
+    if diff <= 100:  return 4.5  - (diff - 70) / 30 * 3.5    # 4.5 → 1
+    if diff <= 130:  return max(0.0, 1.0 - (diff - 100) / 30) # 1 → 0
+    return 0.0
+
+
+def _swell_energy_bonus(swell_height: float, swell_period: float) -> float:
+    """
+    Bonus 0.0–1.0 for high-energy ground swell.
+    Wave power ∝ H² × T (based on linear wave theory).
+    Rewards powerful, long-period swells that create quality surf.
+    """
+    if swell_period < 8 or swell_height < 0.4:
+        return 0.0
+    energy = (swell_height ** 2) * swell_period
+    # Calibrated: 1 m @ 12 s = 12 (entry), 2 m @ 14 s = 56 (quality), 3 m @ 18 s = 162 (epic)
+    if energy < 8:   return 0.0
+    if energy < 30:  return (energy - 8) / 22 * 0.40
+    if energy < 80:  return 0.40 + (energy - 30) / 50 * 0.40
+    return min(1.0, 0.80 + (energy - 80) / 100 * 0.20)
+
+
+def _chop_penalty(wind_wave_h: float, total_h: float, wind_speed: float) -> float:
+    """
+    Penalty 0.0–0.30 for choppiness.
+    High wind-wave fraction + strong wind = heavily textured, unrideable surface.
+    """
+    ww_fraction = wind_wave_h / max(total_h, 0.1) if total_h > 0 else 0.0
+    speed_chop   = max(0.0, (wind_speed - 18) / 60)
+    return min(MAX_CHOP_PENALTY, ww_fraction * 0.22 + speed_chop * 0.12)
 
 
 # Break-type weight presets  (height, period, wind, direction)
 _BREAK_WEIGHTS = {
-    "Point": (0.30, 0.30, 0.25, 0.15),  # long period matters most
-    "Alley": (0.35, 0.25, 0.20, 0.20),  # direction more important
-    "Beach": (0.35, 0.25, 0.25, 0.15),  # balanced
+    "Point": {"height": 0.25, "period": 0.30, "wind": 0.25, "direction": 0.20},
+    "Alley": {"height": 0.28, "period": 0.25, "wind": 0.22, "direction": 0.25},
+    "Beach": {"height": 0.28, "period": 0.25, "wind": 0.27, "direction": 0.20},
 }
 
 
@@ -188,41 +277,79 @@ def surf_score(
 ) -> float:
     """
     Composite surf score 0–10.
-    Uses swell-specific height/period for accuracy, then applies a chop
-    penalty proportional to wind-wave contamination.
+    Combines swell height (per break type), period (ground swell emphasis),
+    wind quality, swell alignment, swell energy bonus, and surface chop penalty.
     """
-    h = _wave_height_score(float(wave_height))
-    p = _period_score(float(wave_period))
-    w = _wind_score(float(wind_speed), float(wind_direction), orientation)
-    s = _swell_dir_score(float(wave_direction), orientation)
+    h_s = _wave_height_score(float(wave_height), break_type)
+    p_s = _period_score(float(wave_period))
+    w_s = _wind_score(float(wind_speed), float(wind_direction), orientation)
+    d_s = _swell_dir_score(float(wave_direction), orientation)
+    energy_bonus = _swell_energy_bonus(float(wave_height), float(wave_period))
+    chop         = _chop_penalty(float(wind_wave_height), float(wave_height), float(wind_speed))
+    bw   = _BREAK_WEIGHTS.get(break_type, _BREAK_WEIGHTS["Beach"])
+    raw  = (h_s * bw["height"] + p_s * bw["period"] +
+            w_s * bw["wind"]   + d_s * bw["direction"])
+    return round(min(10.0, max(0.0, (raw + energy_bonus) * (1.0 - chop))), 1)
 
-    ww, sw = float(wind_wave_height), float(wave_height)
-    chop_penalty = min(MAX_CHOP_PENALTY, (ww / max(sw, 0.1)) * MAX_CHOP_PENALTY)
 
-    bw = _BREAK_WEIGHTS.get(break_type, _BREAK_WEIGHTS["Beach"])
-    raw = h * bw[0] + p * bw[1] + w * bw[2] + s * bw[3]
-    return round(raw * (1 - chop_penalty), 1)
+def get_score_breakdown(
+    wave_height, wave_period, wave_direction,
+    wind_speed, wind_direction, orientation,
+    break_type: str = "Beach",
+    wind_wave_height: float = 0.0,
+) -> dict:
+    """Return individual component scores for the detailed breakdown panel."""
+    return {
+        "height":    round(_wave_height_score(float(wave_height), break_type), 1),
+        "period":    round(_period_score(float(wave_period)), 1),
+        "wind":      round(_wind_score(float(wind_speed), float(wind_direction), orientation), 1),
+        "direction": round(_swell_dir_score(float(wave_direction), orientation), 1),
+        "energy":    round(_swell_energy_bonus(float(wave_height), float(wave_period)), 2),
+        "chop_pct":  round(_chop_penalty(float(wind_wave_height), float(wave_height), float(wind_speed)) * 100, 0),
+    }
 
 
 def score_label(score: float) -> str:
-    if score >= 8: return "🔥 Epic"
-    if score >= 6: return "✅ Good"
-    if score >= 4: return "🟡 Fair"
-    return "❌ Poor"
+    if score >= 9.0: return "🔥 Epic"
+    if score >= 7.5: return "⭐ Very Good"
+    if score >= 6.0: return "✅ Good"
+    if score >= 4.5: return "🟡 Fair"
+    if score >= 3.0: return "🟠 Poor"
+    return "❌ Flat / Blown Out"
 
 
 def score_color(score: float) -> str:
-    if score >= 8: return "#00cc44"
-    if score >= 6: return "#66cc00"
-    if score >= 4: return "#ffaa00"
-    return "#ff4444"
+    if score >= 9.0: return "#7C3AED"   # purple  – epic
+    if score >= 7.5: return "#059669"   # green   – very good
+    if score >= 6.0: return "#0077B6"   # blue    – good
+    if score >= 4.5: return "#D97706"   # amber   – fair
+    if score >= 3.0: return "#EA580C"   # orange  – poor
+    return "#DC2626"                     # red     – flat/blown out
+
+
+def score_description(score: float, wave_height: float, wave_period: float,
+                      wind_speed: float, wind_rel: str) -> str:
+    """One-line human-readable summary of current conditions."""
+    wave_str   = f"{wave_height:.1f} m @ {wave_period:.0f} s"
+    wind_clean = wind_rel.split()[-1]
+    if score >= 9.0:
+        return f"World-class! {wave_str} — drop everything and paddle out. 🤙"
+    if score >= 7.5:
+        return f"Excellent! {wave_str}, {wind_clean} winds — definitely get in the water."
+    if score >= 6.0:
+        return f"Solid surf. {wave_str} with {wind_speed:.0f} km/h {wind_clean} wind."
+    if score >= 4.5:
+        return f"Average conditions. {wave_str} — worth it if you're keen."
+    if score >= 3.0:
+        return f"Poor surf. {wave_str} — only if you're desperate."
+    return "Not worth it. Flat or blown-out conditions."
 
 
 def uv_label(uv: float) -> str:
-    if uv < 3:  return "Low"
-    if uv < 6:  return "Moderate"
-    if uv < 8:  return "High"
-    if uv < 11: return "Very High"
+    if uv < 3:  return "Low 🟢"
+    if uv < 6:  return "Moderate 🟡"
+    if uv < 8:  return "High 🟠"
+    if uv < 11: return "Very High 🔴"
     return "Extreme ☠️"
 
 
@@ -287,53 +414,353 @@ def _safe_col(row, col, fallback=None):
 
 
 # ---------------------------------------------------------------------------
-# Cam gallery helpers
+# Travel-time calculator + "grab your board" messaging
+# ---------------------------------------------------------------------------
+
+# Average coastal road speed used for drive-time estimates (km/h)
+_DRIVE_SPEED_KMH = 60
+# Wax-up / gear prep time added on top of the drive (minutes)
+_PREP_MINS = 20
+
+
+def travel_time_mins(dist_km: float) -> int:
+    """Return estimated one-way drive time in whole minutes."""
+    return max(5, round((dist_km / _DRIVE_SPEED_KMH) * 60))
+
+
+def leave_by_time(best_wave_time: pd.Timestamp, dist_km: float) -> pd.Timestamp:
+    """Return the timestamp you need to walk out the door by."""
+    return best_wave_time - pd.Timedelta(minutes=travel_time_mins(dist_km) + _PREP_MINS)
+
+
+def go_surf_msg(score: float, spot_name: str, best_time: pd.Timestamp,
+                leave_time: pd.Timestamp, drive_mins: int) -> str:
+    """
+    Generate a fun, surf-culture 'go surf' call-to-action.
+    Returns an HTML string ready for st.markdown(unsafe_allow_html=True).
+    """
+    time_str  = best_time.strftime("%H:%M")
+    leave_str = leave_time.strftime("%H:%M")
+    hour      = leave_time.hour
+    day_str   = leave_time.strftime("%A")
+
+    # Time-of-day flavour
+    if hour < 7:
+        sesh_vibe = "dawn patrol 🌅"
+    elif hour < 10:
+        sesh_vibe = "morning sesh 🌤️"
+    elif hour < 14:
+        sesh_vibe = "midday rip ☀️"
+    elif hour < 17:
+        sesh_vibe = "arvo sesh 🌊"
+    else:
+        sesh_vibe = "sunset sesh 🌇"
+
+    drive_str = f"{drive_mins} min drive" if drive_mins >= 10 else "just around the corner"
+
+    if score >= 9.0:
+        headline = f"🔥 This is FIRING — it's going OFF at {spot_name}!"
+        cta      = (f"Drop everything. Grab your board, slap on some wax and "
+                    f"<strong>be out the door by {leave_str}</strong>. "
+                    f"It's a {drive_str} to be at the peak by {time_str}. DO NOT miss this {sesh_vibe}. 🤙")
+    elif score >= 7.5:
+        headline = f"⭐ {spot_name} is pumping — {sesh_vibe} is on!"
+        cta      = (f"Grab your board and towel, double-check the wax and "
+                    f"<strong>be out the door by {leave_str}</strong>. "
+                    f"It's a {drive_str}, and the waves are waiting by {time_str}. Get some! 🏄")
+    elif score >= 6.0:
+        headline = f"✅ Solid surf at {spot_name} — worth the trip!"
+        cta      = (f"Pack your board and a dry towel and "
+                    f"<strong>leave by {leave_str}</strong> on {day_str}. "
+                    f"It's a {drive_str} for a {time_str} splash. You won't regret it. 🤙")
+    elif score >= 4.5:
+        headline = f"🟡 {spot_name} — average but rideable."
+        cta      = (f"If you're keen, pack your gear and "
+                    f"<strong>aim to leave by {leave_str}</strong>. "
+                    f"It's a {drive_str} to make the {time_str} window. Manage your expectations 😄")
+    else:
+        headline = f"🟠 {spot_name} — marginal at best."
+        cta      = (f"Honestly, the couch is calling 🛋️ But if you're desperate, "
+                    f"<strong>leave by {leave_str}</strong> ({drive_str}, "
+                    f"peaking around {time_str}).")
+
+    return headline, cta
+
+
+# ---------------------------------------------------------------------------
+# Detailed wave conditions analysis
+# ---------------------------------------------------------------------------
+
+def wave_conditions_analysis(
+    wave_height: float,
+    swell_height: float,
+    swell_period: float,
+    swell_dir: float,
+    wind_speed: float,
+    wind_dir: float,
+    orientation: float,
+    break_type: str,
+    wind_wave_height: float,
+    water_temp: float | None = None,
+) -> dict:
+    """
+    Returns a comprehensive dict describing wave breaking character, surface texture,
+    currents, hazards, skill level, and wetsuit recommendation.
+    """
+    result = {}
+
+    # ── Face height (surfer's traditional call — approx 1.3× back height) ──
+    face_h = wave_height * 1.3
+    if face_h < 0.4:   face_size = "ankle high"
+    elif face_h < 0.8: face_size = "knee to waist"
+    elif face_h < 1.2: face_size = "waist to chest"
+    elif face_h < 1.6: face_size = "chest to head high"
+    elif face_h < 2.2: face_size = "head high"
+    elif face_h < 3.0: face_size = "overhead"
+    elif face_h < 4.5: face_size = "double overhead"
+    else:              face_size = "triple overhead +"
+    result["face_height"]    = f"{face_h:.1f} m  ({face_size})"
+    result["face_size_label"] = face_size
+
+    # ── Steepness — deep-water wavelength L₀ = 1.56 × T² ──
+    wavelength = 1.56 * (swell_period ** 2) if swell_period > 0 else 1.0
+    steepness  = swell_height / wavelength
+    result["steepness"] = steepness
+
+    # ── Wind relationship to break ──
+    offshore_dir = (orientation + 180) % 360
+    wind_diff    = abs(wind_dir - offshore_dir)
+    if wind_diff > 180: wind_diff = 360 - wind_diff
+    is_offshore = wind_diff < 45
+    is_onshore  = wind_diff > 135
+
+    # ── Breaking character ──
+    if wave_height < 0.3:
+        breaking        = "Flat — no rideable surf"
+        breaking_detail = "The ocean is essentially flat. Great for swimming, absolutely not for surfing."
+    elif is_onshore and wind_speed > 28:
+        breaking        = "Blown Out — messy closeouts"
+        breaking_detail = (f"Strong {wind_speed:.0f} km/h onshore wind is destroying wave shape, "
+                           "creating disorganised, crumbling walls with no clean face.")
+    elif swell_period >= 14 and steepness > 0.018 and (is_offshore or wind_speed < 10):
+        if break_type == "Point":
+            breaking        = "Long Walling Barrels — point-break perfection"
+            breaking_detail = (f"Long-period ground swell ({swell_period:.0f}s) wrapping the point is "
+                               "generating long, mechanical walls with hollow barrel sections. "
+                               "Expect fast, critical take-offs and extended rides.")
+        else:
+            breaking        = "Hollow & Barreling — steep critical faces"
+            breaking_detail = (f"Long-period swell ({swell_period:.0f}s) is throwing up hollow, "
+                               "steep wave faces with real barrel potential. Quick feet required on the drop.")
+    elif swell_period >= 10 and swell_height >= 0.5 and not is_onshore:
+        if break_type == "Point":
+            breaking        = "Long Peeling Walls — quality point-break surf"
+            breaking_detail = (f"Ground swell ({swell_period:.0f}s) is wrapping nicely, producing "
+                               "long, peeling walls ideal for drawn-out turns, cutbacks, and noserides.")
+        else:
+            breaking        = "Peaky & Punchy — defined beach-break peaks"
+            breaking_detail = (f"Solid ground swell ({swell_period:.0f}s) is producing well-defined "
+                               "peaks with good punch. Expect multiple A-frame peaks up and down the beach.")
+    elif swell_period >= 7 and not is_onshore:
+        breaking        = "Peaky & Fun — cruisy beach surf"
+        breaking_detail = (f"Short-to-moderate period ({swell_period:.0f}s) swell is creating fun, "
+                           "rideable peaks. Less power than ground swell but very accessible.")
+    else:
+        breaking        = "Crumbling / Sectiony — wind-swell jumble"
+        breaking_detail = (f"Short-period wind swell ({swell_period:.0f}s) is producing soft, "
+                           "crumbling waves that section quickly — hard to build speed or link turns.")
+    result["breaking"]        = breaking
+    result["breaking_detail"] = breaking_detail
+
+    # ── Surface texture ──
+    if wind_speed < 5:
+        surface        = "🟦 Glassy"
+        surface_detail = "Near-zero wind — mirror-smooth surface. The gold standard."
+    elif is_offshore and wind_speed < 20:
+        surface        = "🟩 Groomed"
+        surface_detail = (f"Offshore wind ({wind_speed:.0f} km/h) is lightly feathering the lips "
+                          "and grooming the wave faces. Excellent conditions.")
+    elif wind_speed < 15:
+        surface        = "🟨 Lightly Textured"
+        surface_detail = (f"Light {wind_speed:.0f} km/h wind adds minor ripples to the surface — "
+                          "still very clean and surfable.")
+    elif wind_speed < 25:
+        surface        = "🟧 Choppy"
+        surface_detail = (f"{wind_speed:.0f} km/h wind is creating chop that makes paddling harder "
+                          "and wave faces messier.")
+    else:
+        surface        = "🟥 Blown Out"
+        surface_detail = f"Strong {wind_speed:.0f} km/h winds have badly degraded surface quality."
+    result["surface"]        = surface
+    result["surface_detail"] = surface_detail
+
+    # ── Longshore drift ──
+    swell_diff = swell_dir - orientation
+    if swell_diff >  180: swell_diff -= 360
+    if swell_diff < -180: swell_diff += 360
+    if abs(swell_diff) < 20:
+        longshore = "Minimal — swell is nearly square-on to the beach."
+    elif swell_diff > 0:
+        longshore = "Pushing RIGHT along the beach (looking shoreward) — drift from swell's left angle."
+    else:
+        longshore = "Pushing LEFT along the beach (looking shoreward) — drift from swell's right angle."
+    result["longshore"] = longshore
+
+    # ── Rip current risk ──
+    if break_type == "Beach":
+        if wave_height > 2.0 or (wave_height > 1.2 and is_onshore):
+            rip_strength = "⚠️ High"
+            rip_detail   = (f"Big beach-break surf ({wave_height:.1f}m) drives powerful rip channels. "
+                            "Identify the darker, calmer water between the peaks before paddling out. "
+                            "If caught in a rip: stay calm, conserve energy, paddle parallel to shore "
+                            "or angle 45° across the rip — never straight against it.")
+        elif wave_height > 0.8:
+            rip_strength = "Moderate"
+            rip_detail   = ("Moderate rip risk. Scan the beach from the sand — rips appear as dark, "
+                            "rippled lanes with fewer breaking waves. Experienced surfers use them as "
+                            "a free elevator out the back.")
+        else:
+            rip_strength = "Low"
+            rip_detail   = ("Small surf means weaker rip currents. Still worth identifying channels "
+                            "from the beach before paddling out.")
+    elif break_type == "Point":
+        rip_strength = "Low–Moderate"
+        rip_detail   = ("Point breaks have a consistent sweep along the rocks. "
+                        "Hug the rocks for an easy paddle-out — fighting the break zone wastes energy. "
+                        "Watch for wash from sets on the inside section.")
+    else:  # Alley / Creek
+        rip_strength = "Moderate"
+        rip_detail   = ("Creek/alley outlets create a steady outflowing current. "
+                        "Paddle out alongside the channel rather than through the whitewash. "
+                        "This current can strengthen significantly during ebb tide.")
+    result["rip_strength"] = rip_strength
+    result["rip_detail"]   = rip_detail
+
+    # ── Hazard level ──
+    if wave_height >= 3.0:
+        hazard       = "🔴 High"
+        hazard_color = "#DC2626"
+    elif wave_height >= 1.8:
+        hazard       = "🟠 Moderate–High"
+        hazard_color = "#EA580C"
+    elif wave_height >= 1.0:
+        hazard       = "🟡 Moderate"
+        hazard_color = "#D97706"
+    else:
+        hazard       = "🟢 Low"
+        hazard_color = "#059669"
+    hazard_notes = []
+    if wave_height >= 3.0:
+        hazard_notes.append(f"Large surf ({wave_height:.1f}m) — powerful hold-downs, reef/shore impact risk")
+    if is_onshore and wind_speed > 30:
+        hazard_notes.append(f"Strong onshore gale ({wind_speed:.0f} km/h) — return-to-shore is difficult")
+    if "High" in rip_strength or "Moderate" in rip_strength:
+        hazard_notes.append(f"Rip current risk: {rip_strength}")
+    if water_temp is not None and water_temp < 17:
+        hazard_notes.append(f"Cold water ({water_temp:.0f}°C) — cold shock risk, wear adequate rubber")
+    result["hazard"]       = hazard
+    result["hazard_color"] = hazard_color
+    result["hazard_notes"] = hazard_notes
+
+    # ── Skill level ──
+    if wave_height < 0.5:
+        skill        = "🟢 All Levels / Beginner"
+        skill_detail = "Very small surf. Ideal for beginners on foam/soft-top boards with supervision."
+    elif wave_height < 1.0 and not is_onshore:
+        skill        = "🟢 Beginner–Intermediate"
+        skill_detail = "Manageable size with decent shape. Fun for learners with basic pop-up and paddling skills."
+    elif wave_height < 1.8 and not is_onshore:
+        skill        = "🟡 Intermediate"
+        skill_detail = (f"Solid {wave_height:.1f}m surf requires confident paddling, duck-diving, "
+                        "and wave reading. Not ideal for beginners.")
+    elif wave_height < 2.8 and (is_offshore or wind_speed < 15):
+        skill        = "🟠 Advanced"
+        skill_detail = (f"Powerful {wave_height:.1f}m surf demands strong paddling, reliable duck-diving, "
+                        "and the ability to handle hold-downs and wipeouts.")
+    else:
+        skill        = "🔴 Expert Only"
+        skill_detail = (f"Serious conditions. {wave_height:.1f}m surf with significant force — "
+                        "experienced big-wave surfers only.")
+    if is_onshore and wind_speed > 30:
+        skill        = "🔴 Expert Only"
+        skill_detail = "Blown-out conditions are dangerous regardless of size."
+    result["skill"]        = skill
+    result["skill_detail"] = skill_detail
+
+    # ── Crowd estimate (time-of-day, Sydney time) ──
+    hour = pd.Timestamp.now(tz="Australia/Sydney").hour
+    if 5 <= hour < 8:     crowd = "🌅 Dawn patrol — hardcore locals, light crowd"
+    elif 8 <= hour < 11:  crowd = "☀️ Morning peak — busiest window, popular spots will be packed"
+    elif 11 <= hour < 14: crowd = "🌤️ Midday — crowd thins as locals break for work/lunch"
+    elif 14 <= hour < 17: crowd = "🌊 Arvo session — second wave of surfers, often windy"
+    else:                 crowd = "🌇 Evening — quiet, sunset chasers only"
+    result["crowd"] = crowd
+
+    # ── Wetsuit recommendation ──
+    if water_temp is not None:
+        if water_temp >= 26:   wetsuit = "Board shorts / rashie 🩲"
+        elif water_temp >= 23: wetsuit = "Springsuit or light 2mm shortie 🩱"
+        elif water_temp >= 20: wetsuit = "2mm–3mm shortie or springsuit 🤿"
+        elif water_temp >= 17: wetsuit = "3mm–4mm full suit 🏊"
+        elif water_temp >= 14: wetsuit = "4mm–5mm full suit + boots 🧊"
+        else:                  wetsuit = "5mm+ hooded full suit + boots + gloves ❄️"
+    else:
+        wetsuit = "Check local conditions — water temp unavailable"
+    result["wetsuit"] = wetsuit
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Cam gallery helpers  (iframe-safe HTML rendering)
 # ---------------------------------------------------------------------------
 
 _GALLERY_COLS   = 3
-_CARD_HEIGHT_PX = 275
-_GALLERY_PAD_PX = 40
+_CARD_HEIGHT_PX = 285
+_GALLERY_PAD_PX = 50
 
 
 def _cam_card_html(cam: dict, idx: int) -> str:
     name         = cam["name"]
     region       = cam["region"]
-    badge_color  = "#e07020" if region == "Gold Coast" else "#1a7a4a"
+    badge_color  = "#b45309" if region == "Gold Coast" else "#047857"
     stream_url   = f"{HLS_BASE}/{cam['stream']}.stream/playlist.m3u8"
 
-    media_html = f"""
-    <div style="position:relative;" id="wrap{idx}">
-      <span style="position:absolute;top:8px;left:8px;z-index:10;
-                   background:#e63946;color:white;font-size:0.62rem;
-                   font-weight:700;padding:2px 8px;border-radius:4px;
-                   letter-spacing:0.08em;pointer-events:none;">&#9679; LIVE</span>
-      <button onclick="goFS({idx})"
-              style="position:absolute;top:8px;right:8px;z-index:10;
-                     background:rgba(0,0,0,0.55);color:white;border:none;
-                     border-radius:4px;padding:3px 7px;font-size:0.75rem;
-                     cursor:pointer;line-height:1.4;" title="Full screen">⛶</button>
-      <video id="cam{idx}" data-src="{stream_url}"
-             muted playsinline controls
-             style="width:100%;height:190px;background:#000;display:block;object-fit:cover;">
-      </video>
-    </div>"""
-
     return f"""
-    <div style="border-radius:12px;overflow:hidden;background:#ffffff;
-                box-shadow:0 2px 10px rgba(0,0,0,0.12);border:1px solid #dde3eb;">
-      {media_html}
-      <div style="padding:10px 12px;display:flex;justify-content:space-between;
-                  align-items:center;gap:6px;">
+    <div style="border-radius:14px;overflow:hidden;background:#ffffff;
+                box-shadow:0 4px 16px rgba(0,0,0,0.10);border:1px solid #e2e8f0;
+                transition:transform 0.18s,box-shadow 0.18s;"
+         onmouseover="this.style.transform='translateY(-3px)';this.style.boxShadow='0 8px 28px rgba(0,0,0,0.16)'"
+         onmouseout="this.style.transform='';this.style.boxShadow='0 4px 16px rgba(0,0,0,0.10)'">
+      <div style="position:relative;" id="wrap{idx}">
+        <span style="position:absolute;top:10px;left:10px;z-index:10;
+                     background:#dc2626;color:white;font-size:0.60rem;
+                     font-weight:800;padding:3px 10px;border-radius:5px;
+                     letter-spacing:0.10em;pointer-events:none;
+                     box-shadow:0 2px 8px rgba(220,38,38,0.45);">● LIVE</span>
+        <button onclick="goFS({idx})"
+                style="position:absolute;top:10px;right:10px;z-index:10;
+                       background:rgba(0,0,0,0.55);color:white;border:none;
+                       border-radius:6px;padding:4px 10px;font-size:0.78rem;
+                       cursor:pointer;backdrop-filter:blur(4px);" title="Full screen">⛶</button>
+        <video id="cam{idx}" data-src="{stream_url}"
+               muted playsinline controls
+               style="width:100%;height:195px;background:#0a0a0a;display:block;object-fit:cover;">
+        </video>
+      </div>
+      <div style="padding:12px 14px;display:flex;justify-content:space-between;
+                  align-items:center;gap:8px;">
         <div style="min-width:0;flex:1;">
-          <div style="color:#1a2332;font-weight:700;font-size:0.9rem;
+          <div style="color:#0f172a;font-weight:700;font-size:0.92rem;
                       white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{name}</div>
-          <span style="display:inline-block;margin-top:3px;background:{badge_color};
-                       color:white;font-size:0.62rem;font-weight:700;padding:2px 8px;
-                       border-radius:4px;letter-spacing:0.04em;">{region.upper()}</span>
+          <span style="display:inline-block;margin-top:5px;background:{badge_color};
+                       color:white;font-size:0.60rem;font-weight:700;padding:2px 9px;
+                       border-radius:4px;letter-spacing:0.06em;">{region.upper()}</span>
         </div>
         <div style="flex-shrink:0;">
-          <span style="background:#dcf5e7;color:#1a7a4a;padding:6px 12px;
-                       border-radius:6px;font-size:0.72rem;font-weight:700;">✅ Live Stream</span>
+          <span style="background:#ecfdf5;color:#059669;padding:5px 12px;
+                       border-radius:6px;font-size:0.72rem;font-weight:700;
+                       border:1px solid #a7f3d0;">✓ Live Stream</span>
         </div>
       </div>
     </div>"""
@@ -355,8 +782,11 @@ def build_cam_gallery(cams: list) -> tuple:
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{background:transparent;padding:4px 2px 8px}}
-  .grid{{display:grid;grid-template-columns:repeat({_GALLERY_COLS},1fr);gap:16px}}
+  body{{background:transparent;padding:6px 4px 12px;
+        font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}}
+  .grid{{display:grid;grid-template-columns:repeat({_GALLERY_COLS},1fr);gap:18px}}
+  @media(max-width:600px){{.grid{{grid-template-columns:1fr}}}}
+  @media(max-width:960px) and (min-width:601px){{.grid{{grid-template-columns:repeat(2,1fr)}}}}
 </style>
 </head><body><div class="grid">{cards}</div>
 <script>
@@ -369,10 +799,11 @@ function initHLS(id, url) {{
     hls.attachMedia(v);
     hls.on(Hls.Events.ERROR, function(e, d) {{
       if (d.fatal) {{
-        v.parentElement.innerHTML = '<div style="height:190px;background:#fdecea;'
-          + 'display:flex;align-items:center;justify-content:center;color:#c0392b;'
-          + 'font-size:0.8rem;text-align:center;padding:1rem;">'
-          + '⚠️ Stream temporarily<br>unavailable</div>';
+        v.parentElement.innerHTML = '<div style="height:195px;background:#fef2f2;'
+          + 'display:flex;align-items:center;justify-content:center;color:#991b1b;'
+          + 'font-size:0.85rem;text-align:center;flex-direction:column;gap:8px;">'
+          + '<span style=\\"font-size:1.8rem\\">📷</span>'
+          + 'Stream temporarily unavailable</div>';
       }}
     }});
   }} else if (v.canPlayType('application/vnd.apple.mpegurl')) {{
@@ -383,13 +814,26 @@ function goFS(idx) {{
   var wrap = document.getElementById('wrap' + idx);
   var el = wrap || document.getElementById('cam' + idx);
   if (!el) return;
-  var req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
-  if (req) req.call(el);
+  var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+  if (fn) fn.call(el);
 }}
 {hls_inits}
 </script>
 </body></html>"""
     return html, height
+
+
+def render_html_safe(html: str, height: int, scrolling: bool = False) -> None:
+    """
+    Render raw HTML using st.iframe (data URI) — avoids st.components.v1.html deprecation.
+    Falls back to components.html for older Streamlit versions.
+    """
+    if hasattr(st, "iframe"):
+        b64 = base64.b64encode(html.encode("utf-8")).decode("utf-8")
+        st.iframe(src=f"data:text/html;base64,{b64}", height=height, scrolling=scrolling)
+    else:
+        import streamlit.components.v1 as _c
+        _c.html(html, height=height, scrolling=scrolling)
 
 
 # ---------------------------------------------------------------------------
@@ -400,40 +844,123 @@ st.set_page_config(page_title="Surf Buddy 🏄", page_icon="🏄", layout="wide"
 
 st.markdown("""
 <style>
-  .stApp { background-color: #f5f7fa; color: #1a2332; }
-  [data-testid="stSidebar"] { background-color: #eef2f7; border-right: 1px solid #d0d8e4; }
+  /* ── Base ── */
+  .stApp { background: #f0f4f8; }
+  .block-container { padding: 1.5rem 2rem 3rem 2rem !important; max-width: 1400px; }
+
+  /* ── Sidebar ── */
+  section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0a2540 0%, #0c3060 100%) !important;
+    border-right: 1px solid rgba(255,255,255,0.08) !important;
+  }
+  section[data-testid="stSidebar"] > div:first-child {
+    padding: 1.5rem 1.1rem 1rem 1.1rem !important;
+  }
+  section[data-testid="stSidebar"] p,
+  section[data-testid="stSidebar"] span,
+  section[data-testid="stSidebar"] label,
+  section[data-testid="stSidebar"] div { color: #cbd5e1 !important; }
+  section[data-testid="stSidebar"] h3,
+  section[data-testid="stSidebar"] h4 { color: #93c5fd !important; font-size: 0.88rem !important; letter-spacing: 0.02em; }
+  section[data-testid="stSidebar"] a { color: #7dd3fc !important; }
+  section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.12) !important; }
+  section[data-testid="stSidebar"] .stSelectbox > div > div {
+    background: rgba(255,255,255,0.08) !important;
+    border: 1px solid rgba(255,255,255,0.16) !important;
+    color: #e2e8f0 !important;
+    border-radius: 8px !important;
+  }
+  section[data-testid="stSidebar"] [data-testid="stSuccess"] {
+    background: rgba(5,150,105,0.18) !important;
+    border: 1px solid rgba(5,150,105,0.35) !important;
+    border-radius: 8px !important;
+  }
+  section[data-testid="stSidebar"] [data-testid="stSuccess"] p { color: #6ee7b7 !important; }
+  section[data-testid="stSidebar"] [data-testid="stInfo"] {
+    background: rgba(59,130,246,0.18) !important;
+    border: 1px solid rgba(59,130,246,0.35) !important;
+    border-radius: 8px !important;
+  }
+  section[data-testid="stSidebar"] [data-testid="stInfo"] p { color: #93c5fd !important; }
+
+  /* ── Metric cards ── */
   [data-testid="stMetric"] {
-    background: #ffffff; border: 1px solid #d0d8e4;
-    border-radius: 10px; padding: 14px 18px;
+    background: #ffffff !important;
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 14px !important;
+    padding: 18px 20px !important;
+    box-shadow: 0 1px 6px rgba(0,0,0,0.06) !important;
   }
-  [data-testid="stMetricValue"] { color: #1a2332 !important; }
-  [data-testid="stMetricLabel"] { color: #4a6080 !important; }
-  h1 { font-size: 2rem !important; font-weight: 700 !important; color: #1a2332 !important; }
-  h2, h3 { color: #1a2332 !important; font-weight: 600 !important; }
-  p, li, .stMarkdown { color: #3a5068 !important; }
-  [data-testid="stTabs"] button { font-weight: 600; color: #4a6080 !important; }
+  [data-testid="stMetricValue"] { color: #0f172a !important; font-size: 1.35rem !important; font-weight: 700 !important; }
+  [data-testid="stMetricLabel"] { color: #64748b !important; font-size: 0.78rem !important; font-weight: 600 !important; text-transform: uppercase; letter-spacing: 0.04em; }
+  [data-testid="stMetricDelta"] { font-size: 0.80rem !important; }
+
+  /* ── Tabs ── */
+  [data-testid="stTabs"] button {
+    font-weight: 600 !important;
+    color: #64748b !important;
+    font-size: 0.95rem !important;
+    padding: 10px 22px !important;
+    border-radius: 0 !important;
+  }
   [data-testid="stTabs"] button[aria-selected="true"] {
-    color: #0077b6 !important; border-bottom-color: #0077b6 !important;
+    color: #0077b6 !important;
+    border-bottom: 3px solid #0077b6 !important;
   }
-  .stCaption { color: #7a95ae !important; }
-  hr { border-color: #d0d8e4 !important; }
-  [data-testid="stRadio"] label { color: #3a5068 !important; }
-  .stDataFrame { background: #ffffff; }
-  [data-testid="stSuccess"] { background: #edfaf3 !important; border-color: #1a7a4a !important; }
-  [data-testid="stSuccess"] p { color: #1a5c38 !important; }
-  [data-testid="stExpander"] { background: #ffffff !important; border-color: #d0d8e4 !important; }
-  [data-testid="stInfo"] { background: #e8f4fd !important; border-color: #90c8f0 !important; }
-  [data-testid="stInfo"] p { color: #1a4a6e !important; }
+
+  /* ── Typography ── */
+  h2, h3 { color: #0f172a !important; font-weight: 700 !important; }
+  p, li { color: #475569 !important; }
+  .stMarkdown p { color: #475569 !important; }
+  .stCaption, [data-testid="stCaptionContainer"] { color: #94a3b8 !important; font-size: 0.80rem !important; }
+  hr { border-color: #e2e8f0 !important; }
+
+  /* ── Alerts ── */
+  [data-testid="stSuccess"] { background: #f0fdf4 !important; border: 1px solid #86efac !important; border-radius: 10px !important; }
+  [data-testid="stSuccess"] p { color: #166534 !important; }
+  [data-testid="stInfo"] { background: #eff6ff !important; border: 1px solid #93c5fd !important; border-radius: 10px !important; }
+  [data-testid="stInfo"] p { color: #1e40af !important; }
+  [data-testid="stWarning"] { background: #fffbeb !important; border: 1px solid #fcd34d !important; border-radius: 10px !important; }
+  [data-testid="stWarning"] p { color: #92400e !important; }
+  [data-testid="stError"] { background: #fef2f2 !important; border: 1px solid #fca5a5 !important; border-radius: 10px !important; }
+  [data-testid="stError"] p { color: #991b1b !important; }
+
+  /* ── Expander & Tables ── */
+  [data-testid="stExpander"] { background: #ffffff !important; border: 1px solid #e2e8f0 !important; border-radius: 12px !important; }
+  .stDataFrame { border-radius: 12px !important; overflow: hidden !important; }
+
+  /* ── Progress bar ── */
+  [data-testid="stProgress"] > div { background: #e2e8f0 !important; border-radius: 100px !important; }
+  [data-testid="stProgress"] > div > div { background: linear-gradient(90deg,#0077b6,#0096c7) !important; border-radius: 100px !important; }
+
+  /* ── Mobile ── */
+  @media (max-width: 768px) {
+    .block-container { padding: 1rem 0.75rem 2rem 0.75rem !important; }
+    [data-testid="stMetricValue"] { font-size: 1.1rem !important; }
+    [data-testid="stTabs"] button { padding: 8px 12px !important; font-size: 0.85rem !important; }
+  }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ──────────────────────────────────────────────────────────────────
+# ── Header banner ────────────────────────────────────────────────────────────
 st.markdown("""
-<div style="padding:12px 0 4px">
-  <span style="font-size:2.2rem;font-weight:800;color:#1a2332;">🏄 Surf Buddy</span>
-  <span style="font-size:0.95rem;color:#7a95ae;margin-left:12px;">
-    Gold Coast Live Cams · Forecast · Near-Me Rankings
-  </span>
+<div style="background:linear-gradient(135deg,#023e8a 0%,#0077b6 60%,#0096c7 100%);
+            border-radius:18px;padding:22px 28px;margin-bottom:22px;
+            display:flex;align-items:center;gap:18px;
+            box-shadow:0 6px 24px rgba(0,119,182,0.28);">
+  <span style="font-size:3rem;line-height:1;">🏄</span>
+  <div>
+    <div style="color:#ffffff;font-size:1.85rem;font-weight:800;line-height:1.15;
+                letter-spacing:-0.02em;">Surf Buddy</div>
+    <div style="color:rgba(255,255,255,0.78);font-size:0.88rem;margin-top:5px;
+                display:flex;gap:16px;flex-wrap:wrap;">
+      <span>🎥 Gold Coast Live Cams</span>
+      <span>·</span>
+      <span>📍 Near Me Rankings</span>
+      <span>·</span>
+      <span>📈 7-Day Forecast</span>
+    </div>
+  </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -481,17 +1008,17 @@ tab_cams, tab_nearme, tab_forecast = st.tabs([
 # ============================================================================
 with tab_cams:
     st.markdown(
-        f'<p style="color:#4a6080;font-size:0.85rem;margin:-4px 0 12px">'
-        f'<strong style="color:#1a7a4a">&#9679; {len(SEQ_CAMS)} live streams</strong> — '
+        f'<p style="color:#64748b;font-size:0.88rem;margin:0 0 14px">'
+        f'<strong style="color:#059669">● {len(SEQ_CAMS)} live streams</strong> — '
         f'Gold Coast City Council (GCCC) direct HLS feeds. '
-        f'Press <strong>⛶</strong> on any camera to go full screen.</p>',
+        f'Tap <strong>⛶</strong> on any camera to go full screen.</p>',
         unsafe_allow_html=True,
     )
 
     visible_cams = SEQ_CAMS
 
     gallery_html, gallery_height = build_cam_gallery(visible_cams)
-    components.html(gallery_html, height=gallery_height, scrolling=False)
+    render_html_safe(gallery_html, height=gallery_height, scrolling=False)
 
 # ============================================================================
 # TAB 2 – NEAR ME
@@ -499,8 +1026,8 @@ with tab_cams:
 with tab_nearme:
     st.subheader(f"📍 Best Surf Near You  ·  {loc_source} location")
     st.caption(
-        f"Ranked by surf score right now, within 200 km of your position "
-        f"({user_lat:.3f}°, {user_lon:.3f}°)."
+        f"Ranked by surf score right now · within {MAX_DISTANCE_KM} km of "
+        f"({user_lat:.3f}°, {user_lon:.3f}°) · drive times assume {_DRIVE_SPEED_KMH} km/h avg"
     )
 
     near_rows = []
@@ -518,21 +1045,23 @@ with tab_nearme:
                 s["orientation"], s["break_type"],
                 _safe_col(srow, "wind_wave_height", 0.0),
             )
-            dist_km = haversine_km(user_lat, user_lon, s["lat"], s["lon"])
+            dist_km  = haversine_km(user_lat, user_lon, s["lat"], s["lon"])
+            drive    = travel_time_mins(dist_km)
             near_rows.append({
-                "Spot":      s["name"],
-                "Region":    s["region"],
-                "Break":     s["break_type"],
-                "Dist (km)": round(dist_km, 1),
-                "Wave (m)":  round(srow["wave_height"], 1),
-                "Swell (m)": round(_safe_col(srow, "swell_wave_height", srow["wave_height"]), 1),
-                "Period (s)":round(_safe_col(srow, "swell_wave_period", srow["wave_period"]), 0),
-                "Wind":      f"{srow['windspeed_10m']:.0f} km/h {compass(srow['winddirection_10m'])}",
-                "Wind qlty": wind_relation(srow["winddirection_10m"], s["orientation"]),
-                "Score":     sc,
-                "Rating":    score_label(sc),
-                "_lat":      s["lat"],
-                "_lon":      s["lon"],
+                "Spot":       s["name"],
+                "Region":     s["region"],
+                "Break":      s["break_type"],
+                "Dist (km)":  round(dist_km, 1),
+                "Drive (min)":drive,
+                "Wave (m)":   round(srow["wave_height"], 1),
+                "Swell (m)":  round(_safe_col(srow, "swell_wave_height", srow["wave_height"]), 1),
+                "Period (s)": round(_safe_col(srow, "swell_wave_period", srow["wave_period"]), 0),
+                "Wind":       f"{srow['windspeed_10m']:.0f} km/h {compass(srow['winddirection_10m'])}",
+                "Wind qlty":  wind_relation(srow["winddirection_10m"], s["orientation"]),
+                "Score":      sc,
+                "Rating":     score_label(sc),
+                "_lat":       s["lat"],
+                "_lon":       s["lon"],
             })
         except Exception:
             pass
@@ -549,20 +1078,54 @@ with tab_nearme:
 
         # ── Top pick hero card ───────────────────────────────────────────────
         if not near_df.empty:
-            top = near_df.iloc[0]
+            top        = near_df.iloc[0]
             hero_color = score_color(top["Score"])
+            drive_mins = int(top["Drive (min)"])
+            # Best window for the top spot to give an accurate leave time
+            try:
+                top_spot_obj  = next(s for s in ALL_SPOTS if s["name"] == top["Spot"])
+                top_df        = get_forecast(top_spot_obj["lat"], top_spot_obj["lon"])
+                top_best5     = best_window(top_df, top_spot_obj)
+                _fallback     = pd.Timestamp.now(tz="Australia/Sydney") + pd.Timedelta(hours=1)
+                best_wave     = top_best5.iloc[0]["time"] if not top_best5.empty else _fallback
+            except Exception:
+                best_wave     = pd.Timestamp.now(tz="Australia/Sydney") + pd.Timedelta(hours=1)
+
+            leave_t    = leave_by_time(best_wave, top["Dist (km)"])
+            headline, cta = go_surf_msg(
+                top["Score"], top["Spot"], best_wave, leave_t, drive_mins
+            )
+
             st.markdown(f"""
-<div style="background:{hero_color}22;border:2px solid {hero_color};border-radius:14px;
-            padding:18px 24px;margin-bottom:16px;">
-  <div style="font-size:1.6rem;font-weight:800;color:#1a2332;">
-    🏆 Go to <span style="color:{hero_color}">{top['Spot']}</span>
+<div style="background:linear-gradient(135deg,{hero_color}18,{hero_color}08);
+            border:2px solid {hero_color};border-radius:18px;
+            padding:22px 26px;margin-bottom:20px;
+            box-shadow:0 4px 20px {hero_color}25;">
+  <div style="font-size:1.45rem;font-weight:800;color:#0f172a;margin-bottom:8px;">
+    {headline}
   </div>
-  <div style="color:#3a5068;margin-top:6px;font-size:0.95rem;">
-    {top['Rating']} &nbsp;·&nbsp; Score <strong style="color:{hero_color}">{top['Score']}/10</strong>
-    &nbsp;·&nbsp; {top['Break']} break
-    &nbsp;·&nbsp; {top['Dist (km)']} km away
-    &nbsp;·&nbsp; {top['Swell (m)']}m swell @ {top['Period (s)']:.0f}s
-    &nbsp;·&nbsp; Wind {top['Wind']} {top['Wind qlty']}
+  <div style="background:rgba(255,255,255,0.85);border-radius:12px;
+              padding:14px 18px;margin:10px 0;font-size:0.98rem;
+              color:#1e293b;line-height:1.6;">
+    🏄 {cta}
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;">
+    <span style="background:{hero_color};color:white;padding:5px 14px;
+                 border-radius:8px;font-size:0.88rem;font-weight:700;">
+      Score {top['Score']}/10 · {top['Rating']}
+    </span>
+    <span style="background:#f1f5f9;color:#475569;padding:5px 14px;
+                 border-radius:8px;font-size:0.88rem;font-weight:600;">
+      🚗 {drive_mins} min · {top['Dist (km)']} km
+    </span>
+    <span style="background:#f1f5f9;color:#475569;padding:5px 14px;
+                 border-radius:8px;font-size:0.88rem;font-weight:600;">
+      🌊 {top['Swell (m)']}m swell @ {top['Period (s)']:.0f}s
+    </span>
+    <span style="background:#f1f5f9;color:#475569;padding:5px 14px;
+                 border-radius:8px;font-size:0.88rem;font-weight:600;">
+      💨 {top['Wind']} {top['Wind qlty']}
+    </span>
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -624,6 +1187,7 @@ with tab_forecast:
     uv_val  = _safe_col(row, "uv_index")
     ww_h    = _safe_col(row, "wind_wave_height", 0.0)
 
+    # Metrics row
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("🌊 Wave Height",  f"{row['wave_height']:.1f} m")
     c2.metric("🌀 Swell",        f"{swell_h:.1f} m @ {swell_p:.0f} s")
@@ -636,41 +1200,242 @@ with tab_forecast:
     c6.metric("☀️ UV Index",
               f"{uv_val:.0f} — {uv_label(uv_val)}" if uv_val is not None else "—")
 
+    # Score banner
     bar_color = score_color(now_score)
+    now_wind_rel = wind_relation(row["winddirection_10m"], spot["orientation"])
+    cond_desc    = score_description(now_score, swell_h, swell_p,
+                                     row["windspeed_10m"], now_wind_rel)
+    bd = get_score_breakdown(
+        swell_h, swell_p, swell_d,
+        row["windspeed_10m"], row["winddirection_10m"],
+        spot["orientation"], spot["break_type"], ww_h,
+    )
+
     st.markdown(f"""
-<div style="background:{bar_color};border-radius:8px;padding:12px 20px;
-            color:white;font-size:1.35rem;font-weight:bold;text-align:center;margin-top:8px;">
-  {score_label(now_score)} &nbsp;|&nbsp; Score: {now_score} / 10
-  &nbsp;·&nbsp; {spot['break_type']} Break
-</div>
-<div style="background:#ffffff;border:1px solid #d0d8e4;border-radius:8px;
-            padding:10px 20px;margin-top:6px;display:flex;gap:24px;flex-wrap:wrap;
-            font-size:0.85rem;color:#3a5068;">
-  <span>Wind quality: <strong style="color:#1a2332">
-    {wind_relation(row['winddirection_10m'], spot['orientation'])}</strong></span>
-  <span>Chop: <strong style="color:#1a2332">{ww_h:.1f} m wind swell</strong></span>
-  <span>Swell direction: <strong style="color:#1a2332">
-    {compass(swell_d)} — {_swell_dir_score(swell_d, spot['orientation']):.0f}/10 for this break</strong></span>
+<div style="background:linear-gradient(135deg,{bar_color}ee,{bar_color}bb);
+            border-radius:14px;padding:16px 22px;color:white;
+            display:flex;align-items:center;justify-content:space-between;
+            flex-wrap:wrap;gap:12px;margin-top:10px;
+            box-shadow:0 4px 16px {bar_color}44;">
+  <div>
+    <div style="font-size:1.6rem;font-weight:900;letter-spacing:-0.02em;">
+      {score_label(now_score)}&ensp;<span style="opacity:0.9">{now_score} / 10</span>
+    </div>
+    <div style="opacity:0.88;font-size:0.92rem;margin-top:4px;">{cond_desc}</div>
+  </div>
+  <div style="background:rgba(255,255,255,0.18);border-radius:10px;padding:10px 16px;
+              font-size:0.85rem;line-height:1.8;min-width:200px;">
+    <div>⛰ Wave Height &nbsp;<strong>{bd['height']}/10</strong></div>
+    <div>⏱ Period Quality &nbsp;<strong>{bd['period']}/10</strong></div>
+    <div>💨 Wind Quality &nbsp;<strong>{bd['wind']}/10</strong></div>
+    <div>🧭 Swell Direction &nbsp;<strong>{bd['direction']}/10</strong></div>
+    <div style="margin-top:4px;opacity:0.80;font-size:0.78rem;">
+      ⚡ Energy bonus +{bd['energy']:.2f} &nbsp;·&nbsp; 🌀 Chop -{bd['chop_pct']:.0f}%
+    </div>
+  </div>
 </div>
 """, unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:18px'></div>", unsafe_allow_html=True)
+
+    # ── Detailed wave conditions analysis ───────────────────────────────────
+    st.subheader("🔍 Detailed Conditions Analysis")
+    cond = wave_conditions_analysis(
+        wave_height       = row["wave_height"],
+        swell_height      = swell_h,
+        swell_period      = swell_p,
+        swell_dir         = swell_d,
+        wind_speed        = row["windspeed_10m"],
+        wind_dir          = row["winddirection_10m"],
+        orientation       = spot["orientation"],
+        break_type        = spot["break_type"],
+        wind_wave_height  = ww_h,
+        water_temp        = water_t,
+    )
+
+    # Row 1 — Breaking & Surface
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown(f"""
+<div style="background:white;border:1px solid #e2e8f0;border-radius:14px;
+            padding:18px 20px;height:100%;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
+  <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;
+              letter-spacing:0.06em;margin-bottom:8px;">🌊 How Waves Are Breaking</div>
+  <div style="font-size:1.05rem;font-weight:700;color:#0f172a;margin-bottom:6px;">
+    {cond['breaking']}
+  </div>
+  <div style="font-size:0.88rem;color:#475569;line-height:1.6;">
+    {cond['breaking_detail']}
+  </div>
+  <div style="margin-top:12px;padding-top:10px;border-top:1px solid #f1f5f9;
+              font-size:0.85rem;color:#64748b;">
+    📏 <strong>Face height:</strong> {cond['face_height']}
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    with col_b:
+        st.markdown(f"""
+<div style="background:white;border:1px solid #e2e8f0;border-radius:14px;
+            padding:18px 20px;height:100%;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
+  <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;
+              letter-spacing:0.06em;margin-bottom:8px;">🪟 Surface Texture</div>
+  <div style="font-size:1.05rem;font-weight:700;color:#0f172a;margin-bottom:6px;">
+    {cond['surface']}
+  </div>
+  <div style="font-size:0.88rem;color:#475569;line-height:1.6;">
+    {cond['surface_detail']}
+  </div>
+  <div style="margin-top:12px;padding-top:10px;border-top:1px solid #f1f5f9;
+              font-size:0.85rem;color:#64748b;">
+    🌀 Wind chop: <strong>{ww_h:.2f} m</strong> &nbsp;·&nbsp;
+    Swell steepness: <strong>{'Hollow' if cond['steepness'] > 0.025 else 'Normal' if cond['steepness'] > 0.012 else 'Mellow'}</strong>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:12px'></div>", unsafe_allow_html=True)
+
+    # Row 2 — Currents
+    col_c, col_d = st.columns(2)
+    with col_c:
+        rip_col = "#DC2626" if "High" in cond['rip_strength'] else "#D97706" if "Moderate" in cond['rip_strength'] else "#059669"
+        st.markdown(f"""
+<div style="background:white;border:1px solid #e2e8f0;border-radius:14px;
+            padding:18px 20px;height:100%;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
+  <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;
+              letter-spacing:0.06em;margin-bottom:8px;">🌀 Rip Currents</div>
+  <div style="display:inline-block;background:{rip_col}18;border:1px solid {rip_col}55;
+              border-radius:8px;padding:4px 12px;font-size:0.88rem;font-weight:700;
+              color:{rip_col};margin-bottom:10px;">Risk: {cond['rip_strength']}</div>
+  <div style="font-size:0.88rem;color:#475569;line-height:1.6;">
+    {cond['rip_detail']}
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    with col_d:
+        st.markdown(f"""
+<div style="background:white;border:1px solid #e2e8f0;border-radius:14px;
+            padding:18px 20px;height:100%;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
+  <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;
+              letter-spacing:0.06em;margin-bottom:8px;">↔️ Longshore Drift & Current</div>
+  <div style="font-size:0.88rem;color:#475569;line-height:1.6;margin-bottom:10px;">
+    {cond['longshore']}
+  </div>
+  <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;
+              letter-spacing:0.06em;margin-bottom:6px;">📍 Crowd Forecast</div>
+  <div style="font-size:0.88rem;color:#475569;">{cond['crowd']}</div>
+</div>""", unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:12px'></div>", unsafe_allow_html=True)
+
+    # Row 3 — Who Should Surf + Gear
+    col_e, col_f = st.columns(2)
+    with col_e:
+        haz_color = cond["hazard_color"]
+        haz_notes_html = "".join(
+            f"<div style='margin-top:6px;font-size:0.82rem;color:#475569;'>⚠️ {n}</div>"
+            for n in cond["hazard_notes"]
+        ) or "<div style='font-size:0.82rem;color:#059669;margin-top:6px;'>No major hazards identified.</div>"
+        st.markdown(f"""
+<div style="background:white;border:1px solid #e2e8f0;border-radius:14px;
+            padding:18px 20px;height:100%;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
+  <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;
+              letter-spacing:0.06em;margin-bottom:8px;">🏄 Who Should Surf This?</div>
+  <div style="font-size:1.0rem;font-weight:700;color:#0f172a;margin-bottom:6px;">{cond['skill']}</div>
+  <div style="font-size:0.88rem;color:#475569;line-height:1.6;">{cond['skill_detail']}</div>
+  <div style="margin-top:12px;padding-top:10px;border-top:1px solid #f1f5f9;">
+    <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;
+                letter-spacing:0.06em;margin-bottom:4px;">
+      Hazard Level: <span style="color:{haz_color}">{cond['hazard']}</span>
+    </div>
+    {haz_notes_html}
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    with col_f:
+        st.markdown(f"""
+<div style="background:white;border:1px solid #e2e8f0;border-radius:14px;
+            padding:18px 20px;height:100%;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
+  <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;
+              letter-spacing:0.06em;margin-bottom:10px;">🧥 What To Wear</div>
+  <div style="font-size:1.0rem;font-weight:700;color:#0f172a;margin-bottom:8px;">
+    {cond['wetsuit']}
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;">
+    <div style="background:#f8fafc;border-radius:8px;padding:10px 12px;">
+      <div style="font-size:0.72rem;color:#94a3b8;font-weight:600;text-transform:uppercase;">Water Temp</div>
+      <div style="font-size:1.05rem;font-weight:700;color:#0f172a;margin-top:2px;">
+        {f"{water_t:.1f} °C" if water_t is not None else "—"}
+      </div>
+    </div>
+    <div style="background:#f8fafc;border-radius:8px;padding:10px 12px;">
+      <div style="font-size:0.72rem;color:#94a3b8;font-weight:600;text-transform:uppercase;">UV Index</div>
+      <div style="font-size:1.05rem;font-weight:700;color:#0f172a;margin-top:2px;">
+        {f"{uv_val:.0f} — {uv_label(uv_val)}" if uv_val is not None else "—"}
+      </div>
+    </div>
+    <div style="background:#f8fafc;border-radius:8px;padding:10px 12px;grid-column:1/-1;">
+      <div style="font-size:0.72rem;color:#94a3b8;font-weight:600;text-transform:uppercase;">Break Type</div>
+      <div style="font-size:0.95rem;font-weight:600;color:#0f172a;margin-top:2px;">
+        {spot['break_type']} Break — facing {spot['orientation']}°
+      </div>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
     st.divider()
 
-    # ── Go Surf recommendation ───────────────────────────────────────────────
+    # ── Go Surf Mode ─────────────────────────────────────────────────────────
     st.subheader("🚀 Go Surf Mode")
     top5 = best_window(df, spot)
     if not top5.empty:
-        best = top5.iloc[0]
-        leave = best["time"] - pd.Timedelta(minutes=30)
-        st.success(
-            f"**Best window:** {best['time'].strftime('%A %d %b, %H:%M')}  |  "
-            f"Score **{best['score']}/10** {score_label(best['score'])}  |  "
-            f"Set your alarm for **{leave.strftime('%H:%M')}** 🤙"
+        best       = top5.iloc[0]
+        dist_to_spot = haversine_km(user_lat, user_lon, spot["lat"], spot["lon"])
+        leave_t    = leave_by_time(best["time"], dist_to_spot)
+        drive_mins = travel_time_mins(dist_to_spot)
+        headline, cta = go_surf_msg(
+            best["score"], spot_name, best["time"], leave_t, drive_mins
         )
-        with st.expander("Top 5 windows in next 48 h"):
+        go_color = score_color(best["score"])
+
+        st.markdown(f"""
+<div style="background:linear-gradient(135deg,{go_color}18,{go_color}08);
+            border:2px solid {go_color};border-radius:18px;
+            padding:22px 26px;margin-bottom:16px;
+            box-shadow:0 4px 20px {go_color}25;">
+  <div style="font-size:1.35rem;font-weight:800;color:#0f172a;margin-bottom:10px;">
+    {headline}
+  </div>
+  <div style="background:rgba(255,255,255,0.90);border-radius:12px;
+              padding:16px 20px;font-size:1.0rem;color:#1e293b;line-height:1.7;">
+    🏄 {cta}
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:14px;">
+    <span style="background:{go_color};color:white;padding:6px 16px;
+                 border-radius:8px;font-size:0.88rem;font-weight:700;">
+      🌊 Score {best['score']}/10 · {score_label(best['score'])}
+    </span>
+    <span style="background:#f1f5f9;color:#334155;padding:6px 16px;
+                 border-radius:8px;font-size:0.88rem;font-weight:600;">
+      📅 {best['time'].strftime('%A %d %b @ %H:%M')}
+    </span>
+    <span style="background:#f1f5f9;color:#334155;padding:6px 16px;
+                 border-radius:8px;font-size:0.88rem;font-weight:600;">
+      🚗 {drive_mins} min · {dist_to_spot:.1f} km
+    </span>
+    <span style="background:#f1f5f9;color:#334155;padding:6px 16px;
+                 border-radius:8px;font-size:0.88rem;font-weight:600;">
+      🏖️ {spot['break_type']} break
+    </span>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        with st.expander("📋 Top 5 windows in the next 48 hours"):
             disp = top5[["time", "wave_height", "wave_period", "windspeed_10m", "score"]].copy()
             disp.columns = ["Time", "Wave (m)", "Period (s)", "Wind (km/h)", "Score"]
-            disp["Time"]  = disp["Time"].dt.strftime("%a %d %b %H:%M")
-            disp["Score"] = disp["Score"].apply(lambda x: f"{x} {score_label(x)}")
+            disp["Time"]     = disp["Time"].dt.strftime("%a %d %b  %H:%M")
+            leave_times      = top5["time"].apply(lambda t: leave_by_time(t, dist_to_spot).strftime("%H:%M"))
+            disp["Leave By"] = leave_times.values
+            disp["Score"]    = disp["Score"].apply(lambda x: f"{x}  {score_label(x)}")
             st.dataframe(disp, use_container_width=True, hide_index=True)
     st.divider()
 
@@ -681,17 +1446,23 @@ with tab_forecast:
     ])
 
     chart_layout = dict(
-        paper_bgcolor="#f5f7fa", plot_bgcolor="#ffffff",
-        font_color="#3a5068", hovermode="x unified",
+        paper_bgcolor="#f0f4f8", plot_bgcolor="#ffffff",
+        font_color="#475569", hovermode="x unified",
+        margin=dict(t=30, b=10, l=10, r=10),
     )
 
     with fc1:
         fig = px.area(df.dropna(subset=["score"]), x="time", y="score",
-                      color_discrete_sequence=["#0096c7"],
+                      color_discrete_sequence=["#0077b6"],
                       labels={"time": "", "score": "Surf Score"})
         fig.update_layout(yaxis_range=[0, 10], **chart_layout)
-        fig.add_hline(y=6, line_dash="dash", line_color="#6fcf97", annotation_text="Good")
-        fig.add_hline(y=8, line_dash="dash", line_color="#f2c94c", annotation_text="Epic")
+        fig.add_hrect(y0=7.5, y1=10, fillcolor="#059669", opacity=0.06, line_width=0)
+        fig.add_hline(y=6.0, line_dash="dot",  line_color="#D97706", line_width=1.5,
+                      annotation_text="Good (6)", annotation_font_color="#D97706")
+        fig.add_hline(y=7.5, line_dash="dash", line_color="#059669", line_width=1.5,
+                      annotation_text="Very Good (7.5)", annotation_font_color="#059669")
+        fig.add_hline(y=9.0, line_dash="dash", line_color="#7C3AED", line_width=1.5,
+                      annotation_text="Epic (9)", annotation_font_color="#7C3AED")
         st.plotly_chart(fig, use_container_width=True)
 
     with fc2:
@@ -790,6 +1561,13 @@ with tab_forecast:
                    .sort_values("Score", ascending=False)
                    .reset_index(drop=True))
         rank_df.index += 1
+        # Add drive time and leave-by from user location
+        rank_df["Drive (min)"] = rank_df.apply(
+            lambda r: travel_time_mins(haversine_km(user_lat, user_lon,
+                next(s for s in SURF_SPOTS[region_sel] if s["name"] == r["Spot"])["lat"],
+                next(s for s in SURF_SPOTS[region_sel] if s["name"] == r["Spot"])["lon"])),
+            axis=1,
+        )
 
         def _color_score(val):
             return f"color: {score_color(val)}; font-weight: bold"
