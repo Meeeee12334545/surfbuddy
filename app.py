@@ -1039,6 +1039,7 @@ st.markdown("""
 # ── Detect user's browser timezone ───────────────────────────────────────────
 _raw_tz = streamlit_js_eval(js_expressions="Intl.DateTimeFormat().resolvedOptions().timeZone", key="tz_detect")
 user_tz = _raw_tz if isinstance(_raw_tz, str) and _raw_tz else "UTC"
+_tz_fallback = not (isinstance(_raw_tz, str) and _raw_tz)
 
 # ── Geolocation (browser first, IP fallback) ─────────────────────────────────
 with st.sidebar:
@@ -1070,6 +1071,10 @@ with st.sidebar:
     }
     st.markdown(f"[📅 BOM Tide Predictions ↗]({tide_urls.get(region_sel, 'https://www.bom.gov.au/australia/tides/')})")
     st.divider()
+    if _tz_fallback:
+        st.caption("⚠️ Could not detect your timezone — times shown in UTC.")
+    else:
+        st.caption(f"🕐 Times shown in: **{user_tz}**")
     st.caption("Data: Open-Meteo · updated every 15 min")
 
 # ── Top-level tabs ───────────────────────────────────────────────────────────
@@ -1571,7 +1576,7 @@ with tab_forecast:
                 line=dict(color="#48cae4", dash="dash")))
         fig2.add_trace(go.Scatter(
             x=df["time"], y=df["wave_period"] / 10, name="Period / 10 (s)",
-            line=dict(color="#0077b6", dash="dot")))
+            line=dict(color="#7c3aed", dash="dot")))
         fig2.update_layout(
             legend=dict(orientation="h", font=dict(size=13, color="#1e293b")),
             yaxis=dict(title="Height (m) | Period / 10 (s)",
@@ -1587,7 +1592,7 @@ with tab_forecast:
             line=dict(color="#e63946"), fill="tozeroy", fillcolor="rgba(230,57,70,0.12)"))
         fig3.add_trace(go.Scatter(
             x=df["time"], y=df["winddirection_10m"], name="Wind Dir (°)",
-            line=dict(color="#c2410c", dash="dot"), yaxis="y2"))
+            line=dict(color="#f4a261", dash="dot"), yaxis="y2"))
         fig3.update_layout(
             yaxis=dict(title="Wind Speed (km/h)",
                        tickfont=dict(size=12, color="#1e293b"),
