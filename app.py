@@ -1542,17 +1542,17 @@ with tab_forecast:
             tickfont=dict(size=12, color="#1e293b"),
             title_font=dict(size=13, color="#1e293b"),
         ),
-        yaxis=dict(
-            tickfont=dict(size=12, color="#1e293b"),
-            title_font=dict(size=13, color="#1e293b"),
-        ),
     )
 
     with fc1:
         fig = px.area(df.dropna(subset=["score"]), x="time", y="score",
                       color_discrete_sequence=["#0077b6"],
                       labels={"time": "", "score": "Surf Score"})
-        fig.update_layout(yaxis_range=[0, 10], **chart_layout)
+        fig.update_layout(
+            yaxis=dict(range=[0, 10],
+                       tickfont=dict(size=12, color="#1e293b"),
+                       title_font=dict(size=13, color="#1e293b")),
+            **chart_layout)
         fig.add_hrect(y0=7.5, y1=10, fillcolor="#059669", opacity=0.06, line_width=0)
         fig.add_hline(y=6.0, line_dash="dot",  line_color="#D97706", line_width=2,
                       annotation_text="Good (6)", annotation_font_color="#D97706",
