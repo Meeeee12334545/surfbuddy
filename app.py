@@ -100,7 +100,7 @@ def _fetch_with_retry(url: str, params: dict, max_retries: int = 3) -> requests.
 
 
 @st.cache_data(ttl=900)
-def fetch_marine(lat: float, lon: float) -> pd.DataFrame:
+def fetch_marine(lat: float, lon: float, tz: str = "UTC") -> pd.DataFrame:
     params = {
         "latitude":  lat,
         "longitude": lon,
@@ -111,31 +111,31 @@ def fetch_marine(lat: float, lon: float) -> pd.DataFrame:
             "sea_surface_temperature",
         ]),
         "forecast_days": 7,
-        "timezone": "Australia/Sydney",
+        "timezone": tz,
     }
     r = _fetch_with_retry(MARINE_URL, params)
     df = pd.DataFrame(r.json()["hourly"])
-    df["time"] = pd.to_datetime(df["time"])
+    df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(tz)
     return df
 
 
 @st.cache_data(ttl=900)
-def fetch_weather(lat: float, lon: float) -> pd.DataFrame:
+def fetch_weather(lat: float, lon: float, tz: str = "UTC") -> pd.DataFrame:
     params = {
         "latitude":  lat,
         "longitude": lon,
         "hourly": "windspeed_10m,winddirection_10m,uv_index",
         "forecast_days": 7,
-        "timezone": "Australia/Sydney",
+        "timezone": tz,
     }
     r = _fetch_with_retry(WEATHER_URL, params)
     df = pd.DataFrame(r.json()["hourly"])
-    df["time"] = pd.to_datetime(df["time"])
+    df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(tz)
     return df
 
 
-def get_forecast(lat: float, lon: float) -> pd.DataFrame:
-    return fetch_marine(lat, lon).merge(fetch_weather(lat, lon), on="time")
+def get_forecast(lat: float, lon: float, tz: str = "UTC") -> pd.DataFrame:
+    return fetch_marine(lat, lon, tz).merge(fetch_weather(lat, lon, tz), on="time")
 
 
 @st.cache_data(ttl=3600)
@@ -437,12 +437,12 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def current_row(df: pd.DataFrame) -> pd.Series:
-    now = pd.Timestamp.now(tz="Australia/Sydney").tz_convert(df["time"].dt.tz)
+    now = pd.Timestamp.now(tz=df["time"].dt.tz)
     return df.loc[(df["time"] - now).abs().idxmin()]
 
 
 def best_window(df: pd.DataFrame, spot: dict) -> pd.DataFrame:
-    now    = pd.Timestamp.now(tz="Australia/Sydney").tz_convert(df["time"].dt.tz)
+    now    = pd.Timestamp.now(tz=df["time"].dt.tz)
     future = df[df["time"] >= now].head(48).copy()
 
     # Keep only daylight hours (sunrise − 30 min → sunset + 30 min).
@@ -450,7 +450,7 @@ def best_window(df: pd.DataFrame, spot: dict) -> pd.DataFrame:
     lat, lon = spot["lat"], spot["lon"]
     _sun_cache: dict = {}
     def _is_daylight(ts: pd.Timestamp) -> bool:
-        local_date = ts.tz_convert("Australia/Sydney").date()
+        local_date = ts.date()   # ts is already tz-aware in the user's local tz
         if local_date not in _sun_cache:
             _sun_cache[local_date] = sun_times(lat, lon, local_date)
         sr, ss = _sun_cache[local_date]
@@ -573,6 +573,7 @@ def wave_conditions_analysis(
     break_type: str,
     wind_wave_height: float,
     water_temp: float | None = None,
+    tz: str = "UTC",
 ) -> dict:
     """
     Returns a comprehensive dict describing wave breaking character, surface texture,
@@ -758,8 +759,8 @@ def wave_conditions_analysis(
     result["skill"]        = skill
     result["skill_detail"] = skill_detail
 
-    # ── Crowd estimate (time-of-day, Sydney time) ──
-    hour = pd.Timestamp.now(tz="Australia/Sydney").hour
+    # ── Crowd estimate (time-of-day, user's local time) ──
+    hour = pd.Timestamp.now(tz=tz).hour
     if 5 <= hour < 8:     crowd = "🌅 Dawn patrol — hardcore locals, light crowd"
     elif 8 <= hour < 11:  crowd = "☀️ Morning peak — busiest window, popular spots will be packed"
     elif 11 <= hour < 14: crowd = "🌤️ Midday — crowd thins as locals break for work/lunch"
@@ -1035,6 +1036,10 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# ── Detect user's browser timezone ───────────────────────────────────────────
+_raw_tz = streamlit_js_eval(js_expressions="Intl.DateTimeFormat().resolvedOptions().timeZone", key="tz_detect")
+user_tz = _raw_tz if isinstance(_raw_tz, str) and _raw_tz else "UTC"
+
 # ── Geolocation (browser first, IP fallback) ─────────────────────────────────
 with st.sidebar:
     st.markdown("### 📍 Your Location")
@@ -1095,7 +1100,13 @@ with tab_cams:
 # TAB 2 – NEAR ME
 # ============================================================================
 with tab_nearme:
-    st.subheader(f"📍 Best Surf Near You  ·  {loc_source} location")
+    _hdr, _btn = st.columns([6, 1])
+    with _hdr:
+        st.subheader(f"📍 Best Surf Near You  ·  {loc_source} location")
+    with _btn:
+        if st.button("🔄 Refresh", use_container_width=True, key="refresh_nearme"):
+            st.cache_data.clear()
+            st.rerun()
     st.caption(
         f"Ranked by surf score right now · within {MAX_DISTANCE_KM} km of "
         f"({user_lat:.3f}°, {user_lon:.3f}°) · drive times assume {_DRIVE_SPEED_KMH} km/h avg"
@@ -1106,7 +1117,7 @@ with tab_nearme:
     for i, s in enumerate(ALL_SPOTS):
         progress.progress((i + 1) / len(ALL_SPOTS), text=f"Checking {s['name']}…")
         try:
-            sdf  = get_forecast(s["lat"], s["lon"])
+            sdf  = get_forecast(s["lat"], s["lon"], user_tz)
             srow = current_row(sdf)
             sc   = surf_score(
                 _safe_col(srow, "swell_wave_height", srow["wave_height"]),
@@ -1155,12 +1166,12 @@ with tab_nearme:
             # Best window for the top spot to give an accurate leave time
             try:
                 top_spot_obj  = next(s for s in ALL_SPOTS if s["name"] == top["Spot"])
-                top_df        = get_forecast(top_spot_obj["lat"], top_spot_obj["lon"])
+                top_df        = get_forecast(top_spot_obj["lat"], top_spot_obj["lon"], user_tz)
                 top_best5     = best_window(top_df, top_spot_obj)
-                _fallback     = pd.Timestamp.now(tz="Australia/Sydney") + pd.Timedelta(hours=1)
+                _fallback     = pd.Timestamp.now(tz=user_tz) + pd.Timedelta(hours=1)
                 best_wave     = top_best5.iloc[0]["time"] if not top_best5.empty else _fallback
             except Exception:
-                best_wave     = pd.Timestamp.now(tz="Australia/Sydney") + pd.Timedelta(hours=1)
+                best_wave     = pd.Timestamp.now(tz=user_tz) + pd.Timedelta(hours=1)
 
             leave_t    = leave_by_time(best_wave, top["Dist (km)"])
             headline, cta = go_surf_msg(
@@ -1219,7 +1230,7 @@ with tab_nearme:
 with tab_forecast:
     with st.spinner("Fetching latest surf data…"):
         try:
-            df = get_forecast(spot["lat"], spot["lon"])
+            df = get_forecast(spot["lat"], spot["lon"], user_tz)
         except Exception as e:
             st.error(f"Could not fetch forecast data: {e}")
             st.stop()
@@ -1322,6 +1333,7 @@ with tab_forecast:
         break_type        = spot["break_type"],
         wind_wave_height  = ww_h,
         water_temp        = water_t,
+        tz                = user_tz,
     )
 
     # Row 1 — Breaking & Surface
@@ -1518,8 +1530,17 @@ with tab_forecast:
 
     chart_layout = dict(
         paper_bgcolor="#f0f4f8", plot_bgcolor="#ffffff",
-        font_color="#475569", hovermode="x unified",
-        margin=dict(t=30, b=10, l=10, r=10),
+        font=dict(color="#1e293b", size=13),
+        hovermode="x unified",
+        margin=dict(t=40, b=40, l=60, r=130),
+        xaxis=dict(
+            tickfont=dict(size=12, color="#1e293b"),
+            title_font=dict(size=13, color="#1e293b"),
+        ),
+        yaxis=dict(
+            tickfont=dict(size=12, color="#1e293b"),
+            title_font=dict(size=13, color="#1e293b"),
+        ),
     )
 
     with fc1:
@@ -1528,12 +1549,15 @@ with tab_forecast:
                       labels={"time": "", "score": "Surf Score"})
         fig.update_layout(yaxis_range=[0, 10], **chart_layout)
         fig.add_hrect(y0=7.5, y1=10, fillcolor="#059669", opacity=0.06, line_width=0)
-        fig.add_hline(y=6.0, line_dash="dot",  line_color="#D97706", line_width=1.5,
-                      annotation_text="Good (6)", annotation_font_color="#D97706")
-        fig.add_hline(y=7.5, line_dash="dash", line_color="#059669", line_width=1.5,
-                      annotation_text="Very Good (7.5)", annotation_font_color="#059669")
-        fig.add_hline(y=9.0, line_dash="dash", line_color="#7C3AED", line_width=1.5,
-                      annotation_text="Epic (9)", annotation_font_color="#7C3AED")
+        fig.add_hline(y=6.0, line_dash="dot",  line_color="#D97706", line_width=2,
+                      annotation_text="Good (6)", annotation_font_color="#D97706",
+                      annotation_font_size=13, annotation_position="right")
+        fig.add_hline(y=7.5, line_dash="dash", line_color="#059669", line_width=2,
+                      annotation_text="Very Good (7.5)", annotation_font_color="#059669",
+                      annotation_font_size=13, annotation_position="right")
+        fig.add_hline(y=9.0, line_dash="dash", line_color="#7C3AED", line_width=2,
+                      annotation_text="Epic (9)", annotation_font_color="#7C3AED",
+                      annotation_font_size=13, annotation_position="right")
         st.plotly_chart(fig, use_container_width=True)
 
     with fc2:
@@ -1547,9 +1571,13 @@ with tab_forecast:
                 line=dict(color="#48cae4", dash="dash")))
         fig2.add_trace(go.Scatter(
             x=df["time"], y=df["wave_period"] / 10, name="Period / 10 (s)",
-            line=dict(color="#90e0ef", dash="dot")))
-        fig2.update_layout(legend=dict(orientation="h"),
-                           yaxis_title="Height (m) | Period / 10 (s)", **chart_layout)
+            line=dict(color="#0077b6", dash="dot")))
+        fig2.update_layout(
+            legend=dict(orientation="h", font=dict(size=13, color="#1e293b")),
+            yaxis=dict(title="Height (m) | Period / 10 (s)",
+                       tickfont=dict(size=12, color="#1e293b"),
+                       title_font=dict(size=13, color="#1e293b")),
+            **chart_layout)
         st.plotly_chart(fig2, use_container_width=True)
 
     with fc3:
@@ -1559,11 +1587,17 @@ with tab_forecast:
             line=dict(color="#e63946"), fill="tozeroy", fillcolor="rgba(230,57,70,0.12)"))
         fig3.add_trace(go.Scatter(
             x=df["time"], y=df["winddirection_10m"], name="Wind Dir (°)",
-            line=dict(color="#f4a261", dash="dot"), yaxis="y2"))
+            line=dict(color="#c2410c", dash="dot"), yaxis="y2"))
         fig3.update_layout(
-            yaxis=dict(title="Wind Speed (km/h)"),
-            yaxis2=dict(title="Wind Direction (°)", overlaying="y", side="right", range=[0, 360]),
-            legend=dict(orientation="h"), **chart_layout)
+            yaxis=dict(title="Wind Speed (km/h)",
+                       tickfont=dict(size=12, color="#1e293b"),
+                       title_font=dict(size=13, color="#1e293b")),
+            yaxis2=dict(title="Wind Direction (°)", overlaying="y", side="right",
+                        range=[0, 360],
+                        tickfont=dict(size=12, color="#1e293b"),
+                        title_font=dict(size=13, color="#1e293b")),
+            legend=dict(orientation="h", font=dict(size=13, color="#1e293b")),
+            **chart_layout)
         st.plotly_chart(fig3, use_container_width=True)
 
     with fc4:
@@ -1574,8 +1608,13 @@ with tab_forecast:
             color_continuous_scale="Blues",
             labels={"wave_direction": "Swell Dir (°)", r_col: "Swell (m)", "score": "Score"})
         fig4.update_layout(
-            polar=dict(angularaxis=dict(direction="clockwise", rotation=90)),
-            paper_bgcolor="#f5f7fa", font_color="#3a5068")
+            polar=dict(
+                angularaxis=dict(direction="clockwise", rotation=90,
+                                 tickfont=dict(size=12, color="#1e293b")),
+                radialaxis=dict(tickfont=dict(size=11, color="#1e293b")),
+            ),
+            paper_bgcolor="#f5f7fa",
+            font=dict(color="#1e293b", size=13))
         st.plotly_chart(fig4, use_container_width=True)
 
     with fc5:
@@ -1590,9 +1629,14 @@ with tab_forecast:
                 x=df["time"], y=df["uv_index"], name="UV Index",
                 line=dict(color="#f4a261"), yaxis="y2"))
         fig5.update_layout(
-            yaxis=dict(title="Water Temp (°C)"),
-            yaxis2=dict(title="UV Index", overlaying="y", side="right", range=[0, 14]),
-            legend=dict(orientation="h"), **chart_layout)
+            yaxis=dict(title="Water Temp (°C)",
+                       tickfont=dict(size=12, color="#1e293b"),
+                       title_font=dict(size=13, color="#1e293b")),
+            yaxis2=dict(title="UV Index", overlaying="y", side="right", range=[0, 14],
+                        tickfont=dict(size=12, color="#1e293b"),
+                        title_font=dict(size=13, color="#1e293b")),
+            legend=dict(orientation="h", font=dict(size=13, color="#1e293b")),
+            **chart_layout)
         st.plotly_chart(fig5, use_container_width=True)
 
     st.divider()
@@ -1603,7 +1647,7 @@ with tab_forecast:
     rank_rows = []
     for s in SURF_SPOTS[region_sel]:
         try:
-            sdf  = get_forecast(s["lat"], s["lon"])
+            sdf  = get_forecast(s["lat"], s["lon"], user_tz)
             srow = current_row(sdf)
             sc   = surf_score(
                 _safe_col(srow, "swell_wave_height", srow["wave_height"]),
