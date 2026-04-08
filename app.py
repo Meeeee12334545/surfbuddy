@@ -1,7 +1,7 @@
 import base64
 import math
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 MAX_CHOP_PENALTY = 0.30   # maximum scoring reduction from wind chop/swell contamination
 MAX_DISTANCE_KM  = 200    # radius used for "Near Me" spot search
@@ -373,6 +373,57 @@ def wind_relation(wind_dir: float, orientation: float) -> str:
     return "🔴 Onshore"
 
 
+def sun_times(lat: float, lon: float, local_date) -> tuple:
+    """Return (sunrise, sunset) as UTC-aware datetimes for the given lat/lon/date.
+
+    Uses the NOAA solar-position approximation (±5 min accuracy).
+    Returns (None, None) under polar-night or midnight-sun conditions.
+    """
+    doy = local_date.timetuple().tm_yday
+    gamma = 2 * math.pi / 365 * (doy - 1)
+
+    # Equation of time (minutes)
+    eot = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(gamma)
+        - 0.032077 * math.sin(gamma)
+        - 0.014615 * math.cos(2 * gamma)
+        - 0.040890 * math.sin(2 * gamma)
+    )
+
+    # Solar declination (radians)
+    decl = (
+        0.006918
+        - 0.399912 * math.cos(gamma)   + 0.070257 * math.sin(gamma)
+        - 0.006758 * math.cos(2*gamma) + 0.000907 * math.sin(2*gamma)
+        - 0.002697 * math.cos(3*gamma) + 0.001480 * math.sin(3*gamma)
+    )
+
+    lat_rad = math.radians(lat)
+    cos_ha = (
+        math.cos(math.radians(90.833)) / (math.cos(lat_rad) * math.cos(decl))
+        - math.tan(lat_rad) * math.tan(decl)
+    )
+
+    if cos_ha > 1:
+        return None, None   # polar night
+    if cos_ha < -1:
+        return None, None   # midnight sun
+
+    ha_deg = math.degrees(math.acos(cos_ha))
+
+    # Solar noon in minutes from midnight UTC
+    solar_noon = 720 - (eot + 4 * lon)
+    sunrise_min = solar_noon - ha_deg * 4
+    sunset_min  = solar_noon + ha_deg * 4
+
+    base = datetime(local_date.year, local_date.month, local_date.day, tzinfo=timezone.utc)
+    return (
+        base + timedelta(minutes=sunrise_min),
+        base + timedelta(minutes=sunset_min),
+    )
+
+
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
     dlat       = math.radians(lat2 - lat1)
@@ -393,6 +444,26 @@ def current_row(df: pd.DataFrame) -> pd.Series:
 def best_window(df: pd.DataFrame, spot: dict) -> pd.DataFrame:
     now    = pd.Timestamp.now(tz="Australia/Sydney").tz_convert(df["time"].dt.tz)
     future = df[df["time"] >= now].head(48).copy()
+
+    # Keep only daylight hours (sunrise − 30 min → sunset + 30 min).
+    # Pre-compute sun times once per unique date to avoid redundant calculations.
+    lat, lon = spot["lat"], spot["lon"]
+    _sun_cache: dict = {}
+    def _is_daylight(ts: pd.Timestamp) -> bool:
+        local_date = ts.tz_convert("Australia/Sydney").date()
+        if local_date not in _sun_cache:
+            _sun_cache[local_date] = sun_times(lat, lon, local_date)
+        sr, ss = _sun_cache[local_date]
+        if sr is None:
+            return True   # midnight sun — always OK
+        ts_utc = ts.tz_convert("UTC")
+        sr_pd  = pd.Timestamp(sr)
+        ss_pd  = pd.Timestamp(ss)
+        return (ts_utc >= sr_pd - pd.Timedelta(minutes=30) and
+                ts_utc <= ss_pd + pd.Timedelta(minutes=30))
+
+    future = future[future["time"].apply(_is_daylight)]
+
     future["score"] = future.apply(
         lambda r: surf_score(
             r.get("swell_wave_height", r["wave_height"]),
