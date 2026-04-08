@@ -12,7 +12,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-from streamlit_js_eval import get_geolocation
+from streamlit_js_eval import get_geolocation, streamlit_js_eval
 
 # ---------------------------------------------------------------------------
 # Live Camera Catalogue – only cams with confirmed HLS streams
